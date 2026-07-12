@@ -1,0 +1,247 @@
+# =============================================================================
+# deployment-rules.yaml
+# Rules for discovering, verifying, and matching public deployments.
+#
+# CRITICAL BOUNDARY: the live application is used ONLY to confirm a real, public
+# deployment exists and corresponds to the repository. NO penetration testing,
+# NO login, NO form submission, NO route enumeration, NO payloads, NO crawling,
+# NO JavaScript execution, NO credential validation. Non-invasive HEAD/GET on
+# "/" only. See README "Ethical restrictions".
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Discovery priority (first match wins, but record all discovered candidates)
+# -----------------------------------------------------------------------------
+discovery_priority:
+  - "github_deployments_api"          # GitHub deployments + deployment_status
+  - "production_environment_url"      # successful production deployment environment_url
+  - "repository_homepage_field"       # repo homepage/website field
+  - "readme_labelled_live_link"       # README links labelled Live Demo/App/Production/etc.
+  - "repository_description"
+  - "github_pages_config"
+  - "deploy_workflow_urls"            # URLs emitted by deploy GitHub Actions
+  - "cname_file"
+  - "hosting_config_files"
+  - "project_documentation"
+
+readme_live_link_labels:
+  - "live demo"
+  - "live app"
+  - "production"
+  - "website"
+  - "deployment"
+  - "try it"
+  - "try it out"
+  - "view application"
+  - "view app"
+  - "demo"
+
+# -----------------------------------------------------------------------------
+# Provider recognition (host suffix -> provider tag). Custom domains are allowed
+# and tagged custom_or_unknown; providers are NOT required.
+# -----------------------------------------------------------------------------
+providers:
+  vercel:            ["vercel.app"]
+  netlify:           ["netlify.app", "netlify.com"]
+  github_pages:      ["github.io"]
+  cloudflare_pages:  ["pages.dev"]
+  render:            ["onrender.com"]
+  firebase:          ["web.app", "firebaseapp.com"]
+  fly:               ["fly.dev"]
+  heroku:            ["herokuapp.com"]
+  railway:           ["railway.app", "up.railway.app"]
+  custom_or_unknown: []               # anything else
+
+# Config files that are SUPPORTING evidence only (never proof of a live app):
+supporting_config_files:
+  - "vercel.json"
+  - "netlify.toml"
+  - "render.yaml"
+  - "wrangler.toml"
+  - "firebase.json"
+  - "CNAME"
+  - ".github/workflows/*deploy*.yml"
+  - ".github/workflows/*deploy*.yaml"
+
+# -----------------------------------------------------------------------------
+# Deployment evidence levels
+# -----------------------------------------------------------------------------
+evidence_levels:
+  A:
+    name: "GitHub deployment evidence"
+    requires:
+      - "GitHub deployment metadata: successful deployment"
+      - "production or equivalent environment"
+      - "non-empty environment URL"
+      - "application reachable"
+  B:
+    name: "Repository homepage evidence"
+    requires:
+      - "repository homepage points to the application"
+      - "application reachable"
+      - "application corresponds to the repository"
+      - "at least one additional correspondence signal"
+  C:
+    name: "README live-link evidence"
+    requires:
+      - "README explicitly labels a live application link"
+      - "application reachable"
+      - "application corresponds to the repository"
+  D:
+    name: "Supporting configuration evidence"
+    requires:
+      - "deployment configuration present"
+    sufficient_for_inclusion: false   # Level D ALONE is not sufficient
+  final_inclusion_requires_level_in: ["A", "B", "C"]   # DEPLOYED track
+
+# -----------------------------------------------------------------------------
+# Non-invasive availability checks
+# -----------------------------------------------------------------------------
+availability_check:
+  allowed_methods: ["HEAD", "GET"]    # GET only as fallback when HEAD unsupported
+  request_path: "/"                   # root only; never undocumented routes
+  connection_timeout_seconds: 5
+  total_timeout_seconds: 15
+  maximum_redirects: 5
+  maximum_response_bytes: 1000000     # 1 MB cap; do not download large assets
+  requests_per_domain_per_minute: 10
+  maximum_verification_attempts: 2
+  execute_javascript: false
+  crawl_links: false
+  submit_forms: false
+  download_assets: false
+  user_agent: "claude-deployed-security-study/0.1 (research; non-invasive availability check; contact via repository)"
+  respect_robots_txt: true
+
+# -----------------------------------------------------------------------------
+# Deployment status classification
+# -----------------------------------------------------------------------------
+status_values:
+  live_states:
+    LIVE_CONFIRMED:
+      description: "2xx/3xx, app/landing loads, not a provider error page, corresponds to repo."
+      eligible: true
+    LIVE_LOGIN_REQUIRED:
+      description: "Public login/landing page of the project loads; further use needs auth. Do NOT log in."
+      eligible: true
+    LIVE_DEGRADED:
+      description: "App loads enough to confirm deployment but shows a backend/runtime error."
+      eligible: true
+      label_separately: true
+  excluded_states:
+    PROVIDER_PROTECTED:  { eligible: false, code: "EX_DEPLOYMENT_PROVIDER_PROTECTED" }
+    DEAD_404:            { eligible: false, code: "EX_DEPLOYMENT_DEAD" }
+    DEAD_410:            { eligible: false, code: "EX_DEPLOYMENT_DEAD" }
+    SERVER_ERROR:        { eligible: false, code: "EX_DEPLOYMENT_SERVER_ERROR" }
+    DNS_FAILURE:         { eligible: false, code: "EX_DEPLOYMENT_DEAD" }
+    TLS_FAILURE:         { eligible: false, code: "EX_DEPLOYMENT_DEAD" }
+    TIMEOUT:             { eligible: false, code: "EX_DEPLOYMENT_TIMEOUT" }
+    PARKED_DOMAIN:       { eligible: false, code: "EX_DEPLOYMENT_PARKED_DOMAIN" }
+    PLACEHOLDER:         { eligible: false, code: "EX_DEPLOYMENT_PLACEHOLDER" }
+    UNRELATED_SITE:      { eligible: false, code: "EX_DEPLOYMENT_UNRELATED" }
+    UNKNOWN:             { eligible: false, code: "EX_DEPLOYMENT_UNVERIFIABLE" }
+
+# Heuristics to distinguish a real app from provider error/placeholder pages.
+provider_error_page_signals:
+  title_or_body_terms:
+    - "deployment not found"
+    - "there's nothing here"
+    - "no such app"
+    - "site not found"
+    - "404: not_found"
+    - "this page could not be found"
+    - "application error"       # Heroku generic error
+    - "just a moment"           # bot-wall interstitial (record, do not bypass)
+    - "coming soon"
+    - "domain for sale"
+    - "buy this domain"
+    - "welcome to nginx"
+    - "it works!"               # default Apache
+    - "vercel - the frontend cloud"   # unconfigured vercel landing
+  # These are heuristics; a title match triggers MANUAL_REVIEW, not auto-exclude,
+  # when the body also contains repo-correspondence signals.
+
+# -----------------------------------------------------------------------------
+# Two-check policy: check availability at screening AND again before freezing.
+# -----------------------------------------------------------------------------
+two_check_policy:
+  first_check_stage: "eligibility_screening"
+  second_check_stage: "pre_freeze"
+  separate_in_time: true
+  qualify_if:
+    - "passes both checks"
+    - "passes final check and earlier failure appears temporary (TIMEOUT/SERVER_ERROR)"
+  post_selection_attrition:
+    replace_on_scanner_results: false
+    record_as: "post_selection_deployment_attrition"
+
+# -----------------------------------------------------------------------------
+# Repository <-> deployment correspondence
+# -----------------------------------------------------------------------------
+correspondence_signals:
+  accepted_non_invasive:
+    - "github_deployment_metadata"
+    - "matching_project_name"
+    - "repository_link_on_deployed_page"     # e.g., footer 'source' link back to repo
+    - "matching_title_and_description"
+    - "custom_domain_configured_in_repo"     # CNAME / hosting config matches
+    - "deployment_workflow_targets_url"
+    - "hosting_config_matches"
+    - "matching_application_branding"
+    - "matching_source_identifiers_in_page"  # visible in normal page content only
+  minimum_signals_required: 1              # Level A implies metadata; B/C require >=1 extra
+  forbidden_invasive_verification: true
+
+# Deployment-commit relationship (only when metadata exposes a commit SHA;
+# for most providers this will be UNKNOWN — expected, and reported honestly).
+commit_relationship_values:
+  - EXACT_COMMIT
+  - DEPLOYED_COMMIT_IS_ANCESTOR
+  - DEPLOYED_COMMIT_IS_DESCENDANT
+  - DIFFERENT_BRANCH
+  - UNKNOWN
+preferred_relationships: ["EXACT_COMMIT", "DEPLOYED_COMMIT_IS_ANCESTOR"]
+# Do NOT claim a repo finding exists in production unless the affected code can
+# be tied to the deployed commit. Primary analysis describes findings as
+# "detected in repository source code", not "in production".
+
+# -----------------------------------------------------------------------------
+# Field storage split (private vs public). See study-config.anonymization.
+# -----------------------------------------------------------------------------
+private_fields:
+  - repository_full_name
+  - repository_url
+  - repository_commit_sha
+  - deployment_url
+  - deployment_provider
+  - deployment_environment
+  - deployment_evidence_level
+  - deployment_evidence_source
+  - deployment_commit_sha
+  - deployment_commit_relationship
+  - first_check_timestamp
+  - first_check_status
+  - first_check_http_status
+  - first_check_final_url
+  - second_check_timestamp
+  - second_check_status
+  - second_check_http_status
+  - second_check_final_url
+  - page_title
+  - content_type
+  - tls_valid
+  - custom_domain
+  - production_or_preview
+  - relationship_evidence
+  - manual_verification_status
+
+public_fields:
+  - anonymous_repository_id
+  - deployment_provider
+  - deployment_evidence_level
+  - deployment_status
+  - production_or_preview
+  - deployment_url_hash        # only if study-config.publish_deployment_url_hash=true (HMAC)
+  - deployment_commit_relationship
+
+publish_deployment_urls: false   # never publish URLs without separate ethics approval

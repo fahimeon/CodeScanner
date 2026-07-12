@@ -1,0 +1,88 @@
+# excluded-paths.txt
+# Paths/globs excluded from RELEVANT source-LOC counting and from
+# substantive-commit line deltas. These are NOT source code we attribute to
+# the project's authors.
+#
+# IMPORTANT: lock files are excluded from LOC but MUST remain on disk for
+# dependency scanning (Trivy / OSV-Scanner). Do not delete them; just don't
+# count them as source.
+#
+# One pattern per line. '#' starts a comment. Matched against repo-relative
+# POSIX paths. A trailing '/' matches a directory subtree.
+
+# --- Dependency / vendor trees ---
+node_modules/
+bower_components/
+vendor/
+.pnp/
+.yarn/
+jspm_packages/
+
+# --- Build / compiled output ---
+dist/
+build/
+out/
+.next/
+.nuxt/
+.svelte-kit/
+.output/
+.vercel/
+.netlify/
+coverage/
+.turbo/
+.cache/
+storybook-static/
+public/build/
+generated/
+__generated__/
+.astro/
+.angular/
+
+# --- Lock files (kept for dependency scanning, not counted as source) ---
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+npm-shrinkwrap.json
+bun.lockb
+
+# --- Minified / bundled / map assets ---
+*.min.js
+*.min.css
+*.bundle.js
+*.map
+*.chunk.js
+
+# --- Generated / snapshot / fixture noise ---
+*.snap
+__snapshots__/
+*.generated.ts
+*.generated.js
+*.d.ts.map
+
+# --- Binary / media / fonts (not source) ---
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.svg
+*.ico
+*.pdf
+*.woff
+*.woff2
+*.ttf
+*.eot
+*.mp4
+*.mp3
+*.wav
+*.zip
+*.gz
+*.tar
+*.wasm
+
+# --- Docs (counted separately as comment/doc, never as source) ---
+# (Markdown is handled by the LOC tool's language classification; listed here
+#  for clarity — do not count docs toward relevant source LOC.)
+CHANGELOG.md
+LICENSE
+LICENSE.md

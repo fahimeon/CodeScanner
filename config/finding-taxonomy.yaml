@@ -1,0 +1,527 @@
+# =============================================================================
+# finding-taxonomy.yaml
+# Canonical finding categories + CWE/OWASP mapping guidance. Findings are mapped
+# to a CWE ONLY when the scanner or clear evidence supports it; otherwise the
+# cwe field is null and category may be "unknown".
+#
+# EVERY category carries a `detection_reliability` describing how well the
+# CONFIGURED scanner stack (see scanner-config.yaml) actually detects it — NOT
+# how important the category is. Any category that is not `strong` also carries
+# a `coverage_limitation` explaining the gap.
+#
+# READ-RESULTS RULE: a repository with zero findings in a category means "no
+# findings were DETECTED by the configured scanners at their pinned
+# versions/rulesets", NOT "the repository is free of that vulnerability class".
+# For `weak` and especially `out_of_scope` categories, absence of findings is
+# essentially uninformative. See `zero_findings_interpretation` below.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Reliability tiers (applied to the CURRENT configured stack)
+# -----------------------------------------------------------------------------
+detection_reliability_definitions:
+  strong: >
+    High-confidence detection of the targeted pattern class: regex/entropy
+    (secrets), known-advisory matching (dependencies), or syntactic
+    configuration/API checks. Low false-negative rate WITHIN the pattern scope.
+  partial: >
+    A configured scanner targets the class, but recall is materially limited —
+    typically because Semgrep Community Edition performs INTRA-FILE taint only
+    (no cross-file/interprocedural dataflow; CodeQL is not in the primary
+    pipeline), or the file/config surface is conditional.
+  weak: >
+    Only narrow syntactic sub-patterns are detected; most real instances
+    (especially dataflow- or logic-dependent ones) are missed. Treat any finding
+    as a lead and any absence as uninformative.
+  out_of_scope: >
+    Not reliably measurable by the current static pipeline at all — the class is
+    business-logic / access-control / concurrency / runtime dependent. No primary
+    scanner emits it; present here only to document the blind spot and to receive
+    manual-review findings if a reviewer identifies one.
+
+# How to interpret an empty result set.
+zero_findings_interpretation: >
+  Zero findings for a repository (overall or per-category) means NO findings were
+  detected by the configured scanners at their pinned versions and rulesets. It
+  does NOT mean the repository is secure. This is especially true for `weak` and
+  `out_of_scope` categories, where the pipeline has little or no sensitivity. All
+  reporting MUST use the phrase "no findings detected by the configured scanners"
+  rather than "secure" or "no vulnerabilities".
+
+# =============================================================================
+# Categories
+# =============================================================================
+categories:
+
+  # ---- Secrets (strong) ----------------------------------------------------
+  exposed_secrets:
+    label: "Exposed secrets"
+    cwe: ["CWE-798", "CWE-540", "CWE-312"]
+    owasp: "A07:2021 Identification and Authentication Failures"
+    typical_scanners: ["gitleaks", "trivy", "semgrep"]
+    detection_reliability: strong
+    note: "Working tree AND git history (gitleaks); triple coverage. Never validated against any live service."
+
+  hardcoded_credentials:
+    label: "Hardcoded credentials"
+    cwe: ["CWE-798"]
+    owasp: "A07:2021 Identification and Authentication Failures"
+    typical_scanners: ["semgrep", "gitleaks", "trivy"]
+    detection_reliability: strong
+    note: "Overlaps exposed_secrets; same regex/entropy detectors."
+
+  # ---- Dependencies (strong, but known-CVE only) ---------------------------
+  vulnerable_dependencies:
+    label: "Vulnerable dependencies"
+    cwe: ["CWE-1035", "CWE-937"]
+    owasp: "A06:2021 Vulnerable and Outdated Components"
+    typical_scanners: ["osv_scanner", "trivy"]
+    detection_reliability: strong
+    note: >
+      Detects KNOWN advisories only, as of the pinned DB snapshot date, and only
+      when a manifest/lockfile is present. Undisclosed-vuln, typosquatted, or
+      malicious packages and zero-days are NOT covered (see supply-chain note in README).
+
+  # ---- Injection / dataflow (partial: intra-file taint only) ---------------
+  cross_site_scripting:
+    label: "Cross-site scripting (XSS)"
+    cwe: ["CWE-79"]
+    owasp: "A03:2021 Injection"
+    typical_scanners: ["semgrep"]
+    detection_reliability: partial
+    coverage_limitation: >
+      Catches sink patterns (dangerouslySetInnerHTML, innerHTML, document.write).
+      Stored/DOM XSS and any XSS requiring cross-file/interprocedural taint are
+      missed by Semgrep CE. CodeQL (optional enhanced track) improves recall.
+
+  sql_injection:
+    label: "SQL injection"
+    cwe: ["CWE-89"]
+    owasp: "A03:2021 Injection"
+    typical_scanners: ["semgrep"]
+    detection_reliability: partial
+    coverage_limitation: >
+      Concatenated/raw-query patterns (pg, knex, sequelize raw) are caught
+      syntactically; ORM-mediated and cross-file request-to-query flows are missed.
+
+  command_injection:
+    label: "Command injection"
+    cwe: ["CWE-78", "CWE-77"]
+    owasp: "A03:2021 Injection"
+    typical_scanners: ["semgrep"]
+    detection_reliability: partial
+    coverage_limitation: >
+      child_process exec/spawn with interpolation caught syntactically; taint from
+      request to sink across functions/files is missed by Semgrep CE.
+
+  path_traversal:
+    label: "Path traversal"
+    cwe: ["CWE-22", "CWE-23"]
+    owasp: "A01:2021 Broken Access Control"
+    typical_scanners: ["semgrep"]
+    detection_reliability: partial
+    coverage_limitation: >
+      Some fs/path + req.param patterns detected; recall depends on cross-file
+      taint that Semgrep CE lacks.
+
+  insecure_deserialization:
+    label: "Insecure deserialization"
+    cwe: ["CWE-502"]
+    owasp: "A08:2021 Software and Data Integrity Failures"
+    typical_scanners: ["semgrep"]
+    detection_reliability: weak
+    coverage_limitation: >
+      Very few JS/TS rules (node-serialize, eval-based). Most unsafe
+      deserialization is not expressible as a stable syntactic pattern.
+
+  # ---- JS/TS-specific injection classes (added) ----------------------------
+  code_injection:
+    label: "Code injection (eval / dynamic code)"
+    cwe: ["CWE-94", "CWE-95"]
+    owasp: "A03:2021 Injection"
+    typical_scanners: ["semgrep"]
+    detection_reliability: partial
+    coverage_limitation: >
+      eval(), Function(), and vm usage with dynamic input are flagged
+      syntactically; whether the input is attacker-controlled (taint) is not
+      resolved across files by Semgrep CE.
+
+  server_side_template_injection:
+    label: "Server-side template injection (SSTI)"
+    cwe: ["CWE-1336", "CWE-94"]
+    owasp: "A03:2021 Injection"
+    typical_scanners: ["semgrep"]
+    detection_reliability: weak
+    coverage_limitation: >
+      Limited rules for template engines (ejs/pug/handlebars) rendering
+      user-controlled templates; low recall and engine-specific.
+
+  nosql_injection:
+    label: "NoSQL injection"
+    cwe: ["CWE-943"]
+    owasp: "A03:2021 Injection"
+    typical_scanners: ["semgrep"]
+    detection_reliability: weak
+    coverage_limitation: >
+      Some MongoDB $where / operator-injection patterns detected; most
+      operator-injection via unvalidated request objects requires taint tracking
+      that Semgrep CE does not perform cross-file. Relevant given Mongo/Supabase targets.
+
+  prototype_pollution:
+    label: "Prototype pollution"
+    cwe: ["CWE-1321"]
+    owasp: "A03:2021 Injection"
+    typical_scanners: ["semgrep"]
+    detection_reliability: partial
+    coverage_limitation: >
+      Semgrep has JS prototype-pollution rules (recursive merge, bracket
+      assignment from user keys), but intra-file only; library-internal sinks and
+      cross-file flows are missed.
+
+  xxe:
+    label: "XML external entity (XXE)"
+    cwe: ["CWE-611"]
+    owasp: "A05:2021 Security Misconfiguration"
+    typical_scanners: ["semgrep"]
+    detection_reliability: weak
+    coverage_limitation: >
+      Less common in JS/TS; a few rules for XML parsers configured with external
+      entities. Most parsers are safe by default, so both prevalence and detection are low.
+
+  redos:
+    label: "Regular-expression denial of service (ReDoS)"
+    cwe: ["CWE-1333", "CWE-400"]
+    owasp: null
+    typical_scanners: ["semgrep"]
+    detection_reliability: weak
+    coverage_limitation: >
+      Detects some catastrophic-backtracking regex shapes, but precision and
+      recall are low and attacker-reachability is not assessed. Not an OWASP
+      Top-10 (2021) category (availability).
+
+  # ---- Auth / access control -----------------------------------------------
+  authentication_weakness:
+    label: "Authentication weaknesses (syntactic)"
+    cwe: ["CWE-287", "CWE-306", "CWE-521"]
+    owasp: "A07:2021 Identification and Authentication Failures"
+    typical_scanners: ["semgrep"]
+    detection_reliability: weak
+    coverage_limitation: >
+      Only narrow syntactic patterns are detected (e.g. JWT alg:none, hardcoded
+      JWT secret, disabled TLS verification). Authentication LOGIC — session
+      lifecycle, credential/MFA/password-reset flows, missing-auth on a route — is
+      NOT reliably measurable statically and is treated as out_of_scope.
+
+  authorization_weakness:
+    label: "Authorization weaknesses / broken access control"
+    cwe: ["CWE-285", "CWE-862", "CWE-863"]
+    owasp: "A01:2021 Broken Access Control"
+    typical_scanners: []
+    detection_reliability: out_of_scope
+    manual_review_only: true
+    coverage_limitation: >
+      Access-control decisions are application/business-logic dependent and not
+      detectable by the static pipeline. No primary scanner emits this category;
+      OWASP A01 is the largest known blind spot. Record only via manual review.
+
+  idor_bola:
+    label: "IDOR / broken object-level authorization (BOLA)"
+    cwe: ["CWE-639", "CWE-284"]
+    owasp: "A01:2021 Broken Access Control"
+    typical_scanners: []
+    detection_reliability: out_of_scope
+    manual_review_only: true
+    coverage_limitation: >
+      Requires understanding object ownership and intended access — not derivable
+      from source patterns. Not measurable by the static pipeline.
+
+  business_logic_flaw:
+    label: "Business-logic flaw"
+    cwe: ["CWE-840"]
+    owasp: "A04:2021 Insecure Design"
+    typical_scanners: []
+    detection_reliability: out_of_scope
+    manual_review_only: true
+    coverage_limitation: >
+      Depends on intended application behaviour; no static signature exists.
+      Not measurable by the static pipeline.
+
+  missing_rate_limiting:
+    label: "Missing rate limiting / anti-automation"
+    cwe: ["CWE-770", "CWE-307"]
+    owasp: "A04:2021 Insecure Design"
+    typical_scanners: []
+    detection_reliability: out_of_scope
+    manual_review_only: true
+    coverage_limitation: >
+      Absence of throttling is a design property, not a code pattern; presence of
+      a limiter can sometimes be seen but its adequacy cannot. Not measurable statically.
+
+  multi_tenant_isolation:
+    label: "Multi-tenant isolation failure"
+    cwe: ["CWE-653"]
+    owasp: "A01:2021 Broken Access Control"
+    typical_scanners: []
+    detection_reliability: out_of_scope
+    manual_review_only: true
+    coverage_limitation: >
+      Tenant-scoping correctness spans queries, middleware, and data model; not
+      detectable by pattern matching. Not measurable by the static pipeline.
+
+  # ---- Session / transport / config (mixed) --------------------------------
+  csrf:
+    label: "Cross-site request forgery (CSRF)"
+    cwe: ["CWE-352"]
+    owasp: "A01:2021 Broken Access Control"
+    typical_scanners: ["semgrep"]
+    detection_reliability: weak
+    coverage_limitation: >
+      Some rules flag disabled CSRF protection or missing SameSite, but whether a
+      state-changing route is actually unprotected is logic-dependent. Most CSRF
+      exposure is not statically decidable.
+
+  insecure_session_config:
+    label: "Insecure session configuration"
+    cwe: ["CWE-614", "CWE-1004", "CWE-384"]
+    owasp: "A05:2021 Security Misconfiguration"
+    typical_scanners: ["semgrep"]
+    detection_reliability: partial
+    coverage_limitation: >
+      express-session / cookie-session flag rules are framework-specific; custom
+      session handling and non-standard stores are missed.
+
+  insecure_cookies:
+    label: "Insecure cookies"
+    cwe: ["CWE-614", "CWE-1004", "CWE-1275"]
+    owasp: "A05:2021 Security Misconfiguration"
+    typical_scanners: ["semgrep"]
+    detection_reliability: strong
+    note: "Cookie flag checks (secure/httpOnly/sameSite) are reliable for common libraries."
+
+  insecure_cors:
+    label: "Insecure CORS"
+    cwe: ["CWE-942"]
+    owasp: "A05:2021 Security Misconfiguration"
+    typical_scanners: ["semgrep"]
+    detection_reliability: strong
+    note: "cors() wildcard / reflected-origin patterns are reliably matched syntactically."
+
+  weak_cryptography:
+    label: "Weak cryptography"
+    cwe: ["CWE-327", "CWE-328", "CWE-326", "CWE-916"]
+    owasp: "A02:2021 Cryptographic Failures"
+    typical_scanners: ["semgrep"]
+    detection_reliability: strong
+    note: "MD5/SHA1, weak ciphers, Math.random-for-tokens are syntactic and reliably detected."
+
+  unsafe_file_handling:
+    label: "Unsafe file handling / upload"
+    cwe: ["CWE-434", "CWE-73"]
+    owasp: "A04:2021 Insecure Design"
+    typical_scanners: ["semgrep"]
+    detection_reliability: weak
+    coverage_limitation: >
+      Some multer/upload/path patterns detected; type/(path)-validation adequacy
+      and cross-file flows are largely missed.
+
+  server_side_request_forgery:
+    label: "Server-side request forgery (SSRF)"
+    cwe: ["CWE-918"]
+    owasp: "A10:2021 Server-Side Request Forgery"
+    typical_scanners: ["semgrep"]
+    detection_reliability: partial
+    coverage_limitation: >
+      fetch/axios/http with user-influenced URLs flagged, but confirming attacker
+      control requires cross-file taint that Semgrep CE lacks → high miss rate.
+
+  open_redirect:
+    label: "Open redirect"
+    cwe: ["CWE-601"]
+    owasp: "A01:2021 Broken Access Control"
+    typical_scanners: ["semgrep"]
+    detection_reliability: partial
+    coverage_limitation: >
+      res.redirect(req...) patterns detected; taint-limited, so redirects assembled
+      across functions are missed.
+
+  information_exposure:
+    label: "Information exposure"
+    cwe: ["CWE-200", "CWE-209"]
+    owasp: "A05:2021 Security Misconfiguration"
+    typical_scanners: ["semgrep"]
+    detection_reliability: weak
+    coverage_limitation: >
+      Only a few patterns (verbose error/stack leakage, committed source maps).
+      Trivy was REMOVED from this category — `trivy fs` does not materially detect
+      information exposure beyond secrets, which are counted under exposed_secrets.
+
+  # ---- Docker / IaC (Trivy) ------------------------------------------------
+  docker_misconfiguration:
+    label: "Docker misconfiguration"
+    cwe: ["CWE-250", "CWE-1188"]
+    owasp: "A05:2021 Security Misconfiguration"
+    typical_scanners: ["trivy"]
+    detection_reliability: strong
+    note: "Trivy misconfig Dockerfile checks are reliable; only fires when a Dockerfile exists."
+
+  infrastructure_misconfiguration:
+    label: "Infrastructure misconfiguration (IaC)"
+    cwe: ["CWE-1032", "CWE-16"]
+    owasp: "A05:2021 Security Misconfiguration"
+    typical_scanners: ["trivy"]
+    detection_reliability: partial
+    coverage_limitation: >
+      Trivy misconfig covers Terraform/K8s/Helm/etc., but JS/TS web apps rarely
+      ship substantial IaC, so the addressable surface is usually small.
+
+  # ---- CI / workflows (zizmor) ---------------------------------------------
+  github_actions_risk:
+    label: "GitHub Actions risks"
+    cwe: ["CWE-94", "CWE-829"]
+    owasp: "A08:2021 Software and Data Integrity Failures"
+    typical_scanners: ["zizmor"]
+    detection_reliability: partial
+    coverage_limitation: >
+      zizmor offline audits (expression injection, dangerous triggers, credential
+      persistence) are effective, but its ONLINE audits (known-vulnerable action
+      lookups) are DISABLED in the sandbox, reducing coverage. Trivy was REMOVED
+      here — `trivy fs` has no material GitHub Actions coverage.
+
+  excessive_workflow_permissions:
+    label: "Excessive workflow permissions"
+    cwe: ["CWE-250", "CWE-732"]
+    owasp: "A05:2021 Security Misconfiguration"
+    typical_scanners: ["zizmor"]
+    detection_reliability: strong
+    note: "zizmor token-permissions audit runs offline and is reliable."
+
+  unpinned_workflow_dependencies:
+    label: "Unpinned workflow dependencies"
+    cwe: ["CWE-829", "CWE-1357"]
+    owasp: "A08:2021 Software and Data Integrity Failures"
+    typical_scanners: ["zizmor"]
+    detection_reliability: partial
+    coverage_limitation: >
+      Detecting an unpinned action (tag/branch ref) works offline; judging whether
+      a PINNED action version is known-vulnerable needs zizmor online audits, which
+      are disabled in the sandbox.
+
+  # ---- Concurrency ---------------------------------------------------------
+  race_condition_toctou:
+    label: "Race condition / TOCTOU"
+    cwe: ["CWE-362", "CWE-367"]
+    owasp: "A04:2021 Insecure Design"
+    typical_scanners: []
+    detection_reliability: out_of_scope
+    manual_review_only: true
+    coverage_limitation: >
+      Concurrency and time-of-check/time-of-use defects require execution-order
+      reasoning; not detectable by the static pipeline.
+
+  # ---- Runtime / deployment (no DAST — by design) --------------------------
+  runtime_deployment_risk:
+    label: "Runtime / deployment-only risk"
+    cwe: ["CWE-16", "CWE-693"]
+    owasp: "A05:2021 Security Misconfiguration"
+    typical_scanners: []
+    detection_reliability: out_of_scope
+    manual_review_only: true
+    coverage_limitation: >
+      Missing security headers on live responses, TLS/cert configuration, exposed
+      admin/debug endpoints, and secrets injected at deploy time (env vars, not in
+      the repo) are only observable at runtime. The ethical boundary forbids DAST,
+      so these are explicitly out of scope — never counted as absent/clean.
+
+# -----------------------------------------------------------------------------
+# Meta buckets for scanner findings that do not map to a category above.
+# (These are not vulnerability classes and carry no reliability tier.)
+# -----------------------------------------------------------------------------
+meta_buckets:
+  other:
+    label: "Other"
+    cwe: []
+    owasp: null
+  unknown:
+    label: "Unknown"
+    cwe: []
+    owasp: null
+
+# -----------------------------------------------------------------------------
+# High-level groupings used for repository-level rollups
+# -----------------------------------------------------------------------------
+groupings:
+  secrets: ["exposed_secrets", "hardcoded_credentials"]
+  dependencies: ["vulnerable_dependencies"]
+  source_code:
+    - cross_site_scripting
+    - sql_injection
+    - command_injection
+    - path_traversal
+    - insecure_deserialization
+    - code_injection
+    - server_side_template_injection
+    - nosql_injection
+    - prototype_pollution
+    - xxe
+    - redos
+    - authentication_weakness
+    - csrf
+    - insecure_session_config
+    - insecure_cookies
+    - insecure_cors
+    - weak_cryptography
+    - unsafe_file_handling
+    - server_side_request_forgery
+    - open_redirect
+    - information_exposure
+  docker_infra: ["docker_misconfiguration", "infrastructure_misconfiguration"]
+  github_actions:
+    - github_actions_risk
+    - excessive_workflow_permissions
+    - unpinned_workflow_dependencies
+  # Explicit blind-spot group: categories the static pipeline cannot reliably
+  # measure. Reported separately so a zero here is never read as "clean".
+  not_reliably_measurable:
+    - authorization_weakness
+    - idor_bola
+    - business_logic_flaw
+    - missing_rate_limiting
+    - multi_tenant_isolation
+    - race_condition_toctou
+    - runtime_deployment_risk
+
+# -----------------------------------------------------------------------------
+# Preventability classification vocabulary (Phase 33). Do not exaggerate
+# automatic preventability; "uncertain"/"unknown" are first-class values.
+# -----------------------------------------------------------------------------
+preventability:
+  dimensions:
+    - detected_automatically_pre_merge
+    - blocked_by_ci_security_gate
+    - prevented_by_repo_policy
+    - prevented_by_dependency_update_automation
+    - prevented_by_secret_pre_commit_scanning
+    - prevented_by_safer_framework_defaults
+  values: ["yes", "often_yes", "uncertain", "no", "unknown"]
+
+# -----------------------------------------------------------------------------
+# Manual-validation labels (single reviewer — DECISION 4). No second rater, so
+# no inter-rater agreement is computed; this is stated as a limitation.
+# -----------------------------------------------------------------------------
+manual_validation:
+  reviewer_count: 1
+  labels:
+    - confirmed
+    - likely_true_positive
+    - uncertain
+    - false_positive
+    - not_reviewable
+    - not_reviewed
+  record_fields:
+    - reviewer_decision
+    - reviewer_confidence
+    - reason
+    - corrected_category
+    - corrected_severity
+    - duplicate_status
+  no_fabricated_outcomes: true

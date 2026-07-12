@@ -1,0 +1,26 @@
+[
+  {
+    "sha": "1111111111111111111111111111111111111111",
+    "url": "https://github.com/octo/alpha-app/commit/1111111111111111111111111111111111111111",
+    "repository": {
+      "fullName": "octo/alpha-app",
+      "url": "https://github.com/octo/alpha-app"
+    },
+    "commit": {
+      "message": "feat: add dashboard\n\n🤖 Generated with Claude Code\nCo-Authored-By: Claude <noreply@anthropic.com>",
+      "author": { "date": "2025-03-05T10:00:00Z" }
+    }
+  },
+  {
+    "sha": "4444444444444444444444444444444444444444",
+    "url": "https://github.com/octo/alpha-app/commit/4444444444444444444444444444444444444444",
+    "repository": {
+      "fullName": "octo/alpha-app",
+      "url": "https://github.com/octo/alpha-app"
+    },
+    "commit": {
+      "message": "refactor: extract api client\n\nGenerated with Claude Code",
+      "author": { "date": "2025-03-02T08:00:00Z" }
+    }
+  }
+]

@@ -1,0 +1,82 @@
+# =============================================================================
+# docker-compose.yml
+# Two isolated services:
+#   collector - GitHub discovery + metadata (network ON, no repo code executed)
+#   scanner   - static scanners in a locked-down sandbox (network OFF at scan time)
+#
+# The scanner service enforces: non-root, read-only repo mount, no docker
+# socket, no host network, CPU/memory/pids/nofile limits, tmpfs scratch.
+# Scans run one repository at a time via scanner-entrypoint.sh.
+#
+# NOTE: `network_mode: none` is applied at RUN time for scanning (after vuln DBs
+# are pre-fetched). The DB-prefetch step runs separately with network enabled.
+# =============================================================================
+
+services:
+  collector:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.collector
+    image: claude-study-collector:latest
+    container_name: claude-study-collector
+    user: "10001:10001"
+    working_dir: /study
+    environment:
+      - GIT_TERMINAL_PROMPT=0
+      - GIT_LFS_SKIP_SMUDGE=1
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./:/study:rw
+      # gh auth is provided via a mounted token file or GH_TOKEN env at runtime;
+      # never bake credentials into the image.
+    # Collector needs network for the GitHub API.
+    networks: [studynet]
+    read_only: false
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  scanner:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.scanner
+    image: claude-study-scanner:latest
+    container_name: claude-study-scanner
+    user: "10001:10001"
+    working_dir: /scan
+    entrypoint: ["/usr/local/bin/scanner-entrypoint.sh"]
+    environment:
+      - PYTHONUNBUFFERED=1
+      - HOME=/tmp
+    volumes:
+      # Repository mounted READ-ONLY. Results written to a separate rw mount.
+      - ./repositories:/scan/repositories:ro
+      - ./results:/scan/results:rw
+      - ./config:/scan/config:ro
+      # Pre-fetched scanner DBs / pinned rules (populated before going offline).
+      - ./config/semgrep-rules-cache:/scan/semgrep-rules:ro
+    # NETWORK DISABLED for scanning. Override only for the DB-prefetch step.
+    network_mode: "none"
+    read_only: true
+    tmpfs:
+      - /tmp:size=1g,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 512
+    ulimits:
+      nofile:
+        soft: 4096
+        hard: 4096
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 4g
+    # No docker.sock mount — the scanner cannot build or run images.
+
+networks:
+  studynet:
+    driver: bridge

@@ -1,0 +1,37 @@
+{
+  "id": 987654321,
+  "node_id": "R_kgDOABCDEF",
+  "name": "alpha-app",
+  "full_name": "octo/alpha-app",
+  "private": false,
+  "owner": {
+    "login": "octo",
+    "id": 111,
+    "type": "User"
+  },
+  "html_url": "https://github.com/octo/alpha-app",
+  "description": "A demo Next.js web application built for the study fixtures.",
+  "fork": false,
+  "url": "https://api.github.com/repos/octo/alpha-app",
+  "created_at": "2025-01-15T10:00:00Z",
+  "updated_at": "2026-05-21T09:00:00Z",
+  "pushed_at": "2026-05-20T12:30:00Z",
+  "homepage": "https://alpha-app.example.com",
+  "size": 8421,
+  "stargazers_count": 42,
+  "watchers_count": 42,
+  "language": "TypeScript",
+  "forks_count": 5,
+  "archived": false,
+  "disabled": false,
+  "open_issues_count": 3,
+  "license": {
+    "key": "mit",
+    "name": "MIT License",
+    "spdx_id": "MIT",
+    "url": "https://api.github.com/licenses/mit"
+  },
+  "topics": ["nextjs", "typescript", "web-app"],
+  "visibility": "public",
+  "default_branch": "main"
+}

@@ -1,0 +1,38 @@
+[
+  {
+    "fullName": "acme/ts-store",
+    "url": "https://github.com/acme/ts-store",
+    "createdAt": "2025-01-10T00:00:00Z",
+    "pushedAt": "2025-03-15T00:00:00Z",
+    "primaryLanguage": { "name": "TypeScript" },
+    "isFork": false,
+    "isArchived": false,
+    "stargazersCount": 12,
+    "description": "A small storefront",
+    "license": { "key": "mit" }
+  },
+  {
+    "fullName": "acme/ts-store",
+    "url": "https://github.com/acme/ts-store",
+    "createdAt": "2025-01-10T00:00:00Z",
+    "pushedAt": "2025-03-15T00:00:00Z",
+    "primaryLanguage": { "name": "TypeScript" },
+    "isFork": false,
+    "isArchived": false,
+    "stargazersCount": 12,
+    "description": "duplicate row (same repo, must dedup)",
+    "license": { "key": "mit" }
+  },
+  {
+    "fullName": "widgets/dash",
+    "url": "https://github.com/widgets/dash",
+    "createdAt": "2025-02-01T00:00:00Z",
+    "pushedAt": "2025-03-28T00:00:00Z",
+    "primaryLanguage": { "name": "TypeScript" },
+    "isFork": false,
+    "isArchived": false,
+    "stargazersCount": 3,
+    "description": "dashboard",
+    "license": null
+  }
+]

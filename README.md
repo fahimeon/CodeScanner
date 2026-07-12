@@ -1,0 +1,327 @@
+# Security Analysis of Deployed Web Applications with Detectable Claude Code-Attributed Development
+
+A reproducible, static-only security-analysis pipeline for public GitHub
+repositories that contain **substantial, publicly detectable Claude Code
+attribution** and back a **currently deployed public web application**.
+
+> **Status:** Checkpoint 1–2. The scaffold plus the pipeline **through deployment
+> discovery/verification and track assignment** are built and unit-tested:
+> environment check (Phase 1), candidate discovery + merge (Phases 2–3), repository
+> metadata (Phase 4), attribution + involvement (Phase 6), project classification
+> (Phase 7), relevant source LOC (Phase 8), eligibility screening + CONSORT funnel
+> (Phase 5/17), deployment URL discovery (Phase 9–10), non-invasive availability
+> + repo↔deployment correspondence + deployed/repository-only track split
+> (Phase 11–13), duplicate/template clustering (Phase 16), population freeze +
+> checksums (Phase 17), stratified selection + 1:1 control matching (Phase 18),
+> scanner preparation + safe clone (Phase 19), and the five isolated static
+> scanners (Phase 20–28). **The results phases (normalize, dedup, analyse, report)
+> are planned but not yet implemented** — run `make status` (or
+> `python scripts/workflow_status.py`) for the authoritative built-vs-planned list.
+> No live collection, deployment probe, or scan has been run. This README describes
+> the full study design and the controls that govern every later phase.
+
+---
+
+## 1. Research objective
+
+Identify, validate, and statically analyse repositories associated with running
+public web applications and containing detectable Claude Code-attributed
+contributions, then measure security-finding prevalence and its (exploratory)
+relationship to detectable Claude involvement.
+
+The study is split into **two tracks** and a **control cohort**:
+
+| Cohort | Definition | Target |
+|---|---|---|
+| **Deployed (treated)** | Detectable Claude attribution **and** a verified, repository-matched live deployment | up to **500** |
+| **Repository-only (treated)** | Same repository eligibility, deployment requirement **dropped** | up to 500 |
+| **Control** | Matched **non-Claude-attributed** JS/TS web apps, identical pipeline | 1:1 match |
+
+The split (a design decision) prevents a shortage of verifiable live deployments
+from collapsing the study; the control cohort enables cautious — never causal —
+Claude-vs-baseline comparison.
+
+### Research questions
+1. % of repositories with ≥1 security finding.
+2. % with critical / high / medium / low findings.
+3. Most frequent vulnerability categories.
+4. Prevalence of exposed secrets.
+5. Prevalence of vulnerable dependencies.
+6. Prevalence of insecure source-code patterns.
+7. Prevalence of Docker/infrastructure misconfigurations.
+8. Prevalence of GitHub Actions workflow risks.
+9. **(Exploratory)** relationship between detectable Claude involvement and findings.
+10. % of findings that could plausibly have been detected/prevented automatically.
+11. Overlap between scanners.
+12. % of deployed apps whose repository version can be connected to the deployed version.
+
+---
+
+## 2. Mandatory terminology
+
+Repositories are **"Claude Code-attributed"**, never "Claude-generated". A
+co-author trailer proves that Claude Code was *involved in some commits*, not
+that it wrote the whole project. Use: *associated with, detected in, observed
+among, correlated with, statically identified in*. **No claim** is made that
+Claude caused any vulnerability.
+
+The sampling frame is **"repositories with publicly detectable Claude Code
+attribution."** Attribution can be disabled, removed, or customised, so this
+sample does **not** represent every project developed with Claude Code (see
+[Limitations](#9-limitations)).
+
+---
+
+## 3. Ethical restrictions (hard boundary)
+
+The live application is used **only** to confirm a real, public deployment
+exists and corresponds to the repository. **No penetration testing.** The
+pipeline must **never**:
+
+- submit forms, create accounts, log in, or test credentials/authn/authz;
+- enumerate routes/directories, fuzz APIs, or send injection payloads;
+- crawl the site, execute page JavaScript, or run browser automation;
+- test file uploads, access databases, or use discovered keys against any service;
+- validate whether a discovered secret is active;
+- execute repository code or run its install/build/test/deploy scripts;
+- upload repository source to any external AI service.
+
+Live checks are limited to a non-invasive `HEAD /` (fallback `GET /`) with tight
+timeouts, a capped response size, a bounded redirect chain, per-domain rate
+limits, and a clearly identified research user agent. All vulnerability
+detection is **static**, against the cloned repository, in an isolated,
+network-disabled, non-root container.
+
+These switches are encoded in [`config/study-config.yaml`](config/study-config.yaml)
+(`safety:`) and enforced in code. Changing any of them is a **protocol
+deviation** that must be recorded.
+
+**Ethics determination:** the study analyses public artifacts and does not
+interact with human subjects or third-party systems. An MSR-ethics /
+IRB-exemption note is maintained with the responsible-disclosure protocol
+(Phase 39). Serious findings follow coordinated disclosure with human approval;
+repositories are never publicly identified in aggregate outputs.
+
+---
+
+## 4. Repository layout
+
+```
+claude-deployed-security-study/
+├── config/     study-wide YAML rules (source of truth; hashed into the manifest)
+├── scripts/    one script per pipeline phase
+├── docker/     collector + scanner images and the locked-down entrypoint
+├── data/       raw/ interim/ processed/ private/ public/
+├── repositories/  cloned candidates + selected (NEVER committed)
+├── results/    raw/ redacted/ normalized/ deduplicated/ validation/ tables/ figures/ reports/
+├── logs/
+├── tests/      synthetic-fixture unit tests (no real secrets, ever)
+└── docs/       candidate-discovery plan, design notes
+```
+
+**Never committed publicly** (see [`.gitignore`](.gitignore)):
+`data/private/`, `repositories/`, `results/raw/`,
+`results/reports/private-repositories/`.
+
+---
+
+## 5. Configuration (source of truth)
+
+| File | Purpose |
+|---|---|
+| `config/study-config.yaml` | Global parameters: seed, window, tracks, control cohort, stats, safety switches |
+| `config/inclusion-rules.yaml` | Positive eligibility + substantial-attribution rules A–D |
+| `config/exclusion-rules.yaml` | Exclusion codes + detection heuristics |
+| `config/deployment-rules.yaml` | Deployment discovery, evidence levels, non-invasive checks, repo match |
+| `config/scanner-config.yaml` | Scanner pinning, offline sequencing, container isolation, clone safety |
+| `config/severity-mapping.yaml` | Native → normalized severity |
+| `config/finding-taxonomy.yaml` | Categories, CWE/OWASP map, preventability, validation labels |
+| `config/excluded-paths.txt` | Paths excluded from relevant-LOC counting |
+
+Every config file is SHA-256-hashed into
+`results/reports/environment-manifest.json` so any run is tied to an exact
+configuration.
+
+---
+
+## 6. Tooling requirements
+
+Git · GitHub CLI (`gh`) · Docker · Python ≥ 3.11 · Gitleaks · Semgrep Community
+Edition · Trivy · OSV-Scanner · Zizmor · `tokei` or `cloc`.
+
+The **primary pipeline** is exactly these five scanners, and **all headline
+measurements come from them**:
+
+| Scanner | Role | Notes |
+|---|---|---|
+| Gitleaks | Secrets | Working tree + git history |
+| Semgrep CE | Source code | Community Edition = **intra-file taint only** (no cross-file dataflow) |
+| Trivy | Dependencies, misconfig, secrets | `--scanners vuln,misconfig,secret` — **license scanning is NOT enabled** (compliance, not a security measurement) |
+| OSV-Scanner | Dependencies | Known advisories only |
+| Zizmor | GitHub Actions | Offline audits; **online audits disabled** in the sandbox |
+
+**CodeQL (JS/TS)** is an **optional enhanced-analysis track**, not one of the
+five. It adds the interprocedural taint Semgrep CE lacks; its results are stored
+under `results/raw/codeql/` and **reported separately — never merged into
+primary-pipeline numbers**. `make scan` runs only the primary five.
+
+Validate and record versions:
+
+```bash
+make check          # -> results/reports/environment-manifest.json
+gh auth status      # authenticate first with: gh auth login
+```
+
+`check_environment.py` uses **stdlib only** (runs before `pip install`) and
+never prints or stores tokens.
+
+---
+
+## 7. Pipeline (run in order)
+
+> Phases through eligibility screening are implemented (`check`, `collect`, `merge`,
+> `metadata`, `verify-attribution`, `classify`, `calculate-loc`, `screen`, plus
+> `-control` variants). The deployment, selection, scanning, and results targets
+> below are **planned**; invoking one prints a clear `[NOT IMPLEMENTED]` notice
+> rather than running. To see exactly what is built, run `make status` — or,
+> where GNU Make is unavailable (e.g. Windows PowerShell),
+> `python scripts/workflow_status.py`.
+
+```bash
+make check                 # Phase 1  environment + manifest
+make collect               # Phase 2  discover Claude-attributed candidates
+make collect-control       #          discover matched non-Claude controls
+make merge                 # Phase 3  merge + deduplicate candidates
+make metadata              # Phase 4  repository metadata
+make verify-attribution    # Phase 6  attribution + substantiality + reachability
+make classify              # Phase 7  project type / framework / tech indicators
+make calculate-loc         # Phase 8  relevant source LOC (tokei/cloc)
+make discover-deployments  # Phase 9-10 deployment URLs + evidence levels
+make verify-deployments    # Phase 11-13 non-invasive availability + repo match
+make detect-duplicates     # Phase 16 duplicate/template clustering
+make screen                # Phase 5/17 eligibility screening
+make freeze                # Phase 17 freeze eligible population + checksums
+make select                # Phase 18 select exactly 500 (+control matching)
+make prepare-scanners      # Phase 19 build scanner image, prefetch/pin DBs, record digest
+make pilot                 # Phase 27 10-repository scanner pilot
+make scan                  # Phase 20-28 full static scan (guarded)
+make normalize             # Phase 29-30 normalize + redact + classify
+make deduplicate-findings  # Phase 32 cross-scanner dedup
+make validation-sample     # Phase 33 sample findings for manual validation
+make analyse               # Phase 35-36 statistics
+make figures               # Phase 37 figures
+make report                # Phase 40 reports
+make public-dataset        # Phase 38 anonymised public dataset
+```
+
+**Ordering guarantees enforced in code**
+- Selection happens **before** scanning; `make scan` refuses to run unless
+  `data/processed/selected-500-repositories.csv` exists.
+- Repositories are **never** selected or de-selected based on scanner results.
+- Raw scanner output and raw search dumps are **immutable**; writes are atomic
+  (`*.tmp` → `os.replace`).
+
+### Detection scope and how to read results
+
+> **A repository with zero findings means "no findings were detected by the
+> configured scanners at their pinned versions and rulesets" — NOT that the
+> repository is secure.** Every report uses "no findings detected by the
+> configured scanners", never "secure" or "no vulnerabilities".
+
+Every taxonomy category in
+[`config/finding-taxonomy.yaml`](config/finding-taxonomy.yaml) carries a
+`detection_reliability` tier describing how well *this* stack actually detects it
+(not how important it is):
+
+- **strong** — high-confidence detection (secrets, known-CVE dependencies,
+  syntactic crypto/cookie/CORS/Docker/workflow-permission checks).
+- **partial** — targeted but recall-limited by Semgrep CE's intra-file-only taint
+  (XSS, SQLi, command injection, path traversal, SSRF, open redirect, code
+  injection, prototype pollution, session config, IaC misconfig, GitHub Actions).
+- **weak** — only narrow syntactic sub-patterns matched; most instances missed
+  (insecure deserialization, NoSQL injection, SSTI, XXE, ReDoS, CSRF,
+  authentication *syntactic* checks, unsafe file handling, information exposure).
+- **out_of_scope** — **not reliably measurable by this static pipeline at all**;
+  no primary scanner emits them, and they are recorded only via manual review.
+
+**Explicitly out of scope** (OWASP A01 and logic/runtime classes) — kept in the
+taxonomy solely to document the blind spot, grouped under
+`not_reliably_measurable`:
+
+- authorization / broken access control, **IDOR/BOLA**, authentication *logic*,
+  **business-logic flaws**, **missing rate limiting**, **multi-tenant isolation**,
+  race conditions / TOCTOU;
+- **runtime/deployment-only** risks — missing security headers on live responses,
+  TLS/cert config, exposed admin/debug endpoints, and deploy-time env-var secrets
+  (never in the repo). The no-DAST ethical boundary forbids observing these.
+
+**Supply chain:** OSV-Scanner/Trivy match *known* advisories only. Typosquatted,
+malicious, undisclosed-vuln, or zero-day dependencies are not detected; a "0
+dependency findings" result means "no known CVEs in the pinned DB".
+
+Analyses report `weak`/`out_of_scope` categories separately from
+`strong`/`partial` ones so that low counts in low-sensitivity categories are read
+as **low detection sensitivity, not low prevalence**.
+
+---
+
+## 8. Privacy
+
+Two datasets are maintained. **Private** (`data/private/`, never distributed):
+repository name/URL, deployment URL, commit SHA, disclosure contacts.
+**Public** (`data/public/`, publishable after curation): anonymous IDs
+(`CLR-0001…`, `CTR-0001…`), coarse metadata, anonymised findings, scanner
+status, involvement metrics. Never published: plaintext secrets, private keys,
+tokens, full sensitive code snippets, or any ID→identity mapping. Deployment
+URLs are not published; URL "hashes" are omitted by default because plain
+hashing of a public URL is reversible (a keyed HMAC with a private key would be
+required).
+
+---
+
+## 9. Limitations
+
+1. Claude Code attribution can be removed/disabled → the frame is *detectable*
+   attribution only.
+2. Deployed projects differ from undeployed ones (maturity/survivorship bias);
+   the deployment gate is a strong, biasing filter.
+3. The **involvement** variable measures *attribution retention*, not actual
+   Claude usage intensity → RQ9 is **exploratory** and cannot compare
+   Claude-vs-non-Claude usage levels.
+4. Static scanners have false positives/negatives. **Zero findings means "no
+   findings detected by the configured scanners", not "secure".** Access-control
+   (authorization, IDOR/BOLA, multi-tenant isolation), authentication *logic*,
+   business-logic, rate-limiting, concurrency (TOCTOU), and runtime/deployment-only
+   risks are **not reliably measurable** by this pipeline (marked `out_of_scope`);
+   many injection classes are only `partial`/`weak` because Semgrep CE does
+   intra-file taint only. Low counts in low-sensitivity categories reflect
+   detection sensitivity, not prevalence. CodeQL (optional track) and manual
+   review partially mitigate but do not close these gaps.
+5. Dependency/vuln databases and scanner rules are pinned "as of scan date";
+   dependency CVEs accumulate with time → repo/commit **age** is a required
+   covariate.
+6. A repo's latest commit may differ from the deployed commit; most providers do
+   not expose the deployed SHA, so RQ12 is expected to be largely `UNKNOWN`.
+7. Live verification proves the app is reachable, not that every feature works;
+   static findings do not prove production exploitability.
+8. Correlation with Claude involvement is **not** causation.
+9. Scope is JS/TS web apps only.
+10. Single reviewer for manual validation → no inter-rater agreement statistic.
+11. GitHub's search index is mutable; the reproducibility artifact is the saved
+    raw search JSON, not the live query.
+
+---
+
+## 10. Reproducibility
+
+Fixed seed `20260711`; UTC ISO-8601 timestamps; SHA-256 checksums for frozen
+datasets and configs; pinned scanner versions, ruleset commits/hashes, and vuln
+DB snapshot dates recorded in the manifest. See
+[`docs/candidate-discovery-plan.md`](docs/candidate-discovery-plan.md) for the
+discovery methodology and the measured-funnel approach to pool sizing.
+
+## License
+
+Pipeline code: MIT ([`LICENSE`](LICENSE)). Collected repository source, the
+private dataset, and deployment URLs are **not** licensed for redistribution;
+only anonymised aggregates are published.

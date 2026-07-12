@@ -1,0 +1,85 @@
+# =============================================================================
+# severity-mapping.yaml
+# Map each scanner's native severity vocabulary onto a common normalized scale.
+# BOTH the original and normalized severities are preserved on every finding.
+# Scanner severity systems are NOT assumed equivalent; when reliable severity
+# information is unavailable, the normalized value is "unknown".
+# =============================================================================
+
+normalized_scale:
+  - critical
+  - high
+  - medium
+  - low
+  - informational
+  - unknown
+
+# -----------------------------------------------------------------------------
+# Per-scanner mappings. Keys are lowercased native values; unmatched -> unknown.
+# -----------------------------------------------------------------------------
+mappings:
+
+  semgrep:
+    # Semgrep uses ERROR/WARNING/INFO in results; metadata may carry
+    # 'severity' and 'confidence'. Map the rule/result severity here.
+    error: high
+    warning: medium
+    info: low
+    # metadata.impact / metadata.likelihood may refine; handled in code, not here.
+
+  gitleaks:
+    # Gitleaks findings have no severity; a detected secret is treated as high
+    # by default (exposed credential). Category refinement in finding-taxonomy.
+    _default: high
+
+  trivy:
+    critical: critical
+    high: high
+    medium: medium
+    low: low
+    unknown: unknown
+    # Trivy misconfig severities share the same words.
+
+  osv_scanner:
+    # OSV severity comes via CVSS or advisory database_specific severity.
+    # When only a CVSS vector/score is present, derive from score in code:
+    #   >= 9.0 critical, 7.0-8.9 high, 4.0-6.9 medium, 0.1-3.9 low, else unknown
+    critical: critical
+    high: high
+    moderate: medium
+    medium: medium
+    low: low
+    _default: unknown
+
+  zizmor:
+    # Zizmor uses severity levels (informational/low/medium/high) and a
+    # separate confidence. Map severity here.
+    high: high
+    medium: medium
+    low: low
+    informational: informational
+    _default: unknown
+
+# -----------------------------------------------------------------------------
+# CVSS score -> normalized band (used when a scanner exposes only a score)
+# -----------------------------------------------------------------------------
+cvss_to_normalized:
+  critical: { min: 9.0, max: 10.0 }
+  high:     { min: 7.0, max: 8.9 }
+  medium:   { min: 4.0, max: 6.9 }
+  low:      { min: 0.1, max: 3.9 }
+  informational: { min: 0.0, max: 0.0 }
+
+# -----------------------------------------------------------------------------
+# Confidence normalization (kept separate from severity)
+# -----------------------------------------------------------------------------
+confidence_scale: ["high", "medium", "low", "unknown"]
+confidence_mappings:
+  semgrep: { high: high, medium: medium, low: low }
+  zizmor:  { high: high, medium: medium, low: low, unknown: unknown }
+  _default_when_absent: "unknown"
+
+policy:
+  preserve_original_severity: true
+  default_when_unavailable: "unknown"
+  do_not_assume_cross_scanner_equivalence: true

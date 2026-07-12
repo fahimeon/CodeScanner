@@ -1,0 +1,161 @@
+# =============================================================================
+# inclusion-rules.yaml
+# Positive eligibility criteria. A repository is ELIGIBLE only if it satisfies
+# every hard requirement below. Track assignment (deployed vs repository_only)
+# happens AFTER repository-side eligibility, based solely on the deployment gate.
+#
+# Rule of engagement: NEVER weaken these to reach 500. If the eligible pool is
+# short, report the number and the reasons (see study-config tracks.allow_shortfall).
+# =============================================================================
+
+hard_requirements:
+  # --- Repository status ---------------------------------------------------
+  public: true
+  not_archived: true
+  not_fork: true
+  has_default_branch: true
+  not_empty: true
+
+  # --- Language / project shape -------------------------------------------
+  primary_language_in: ["JavaScript", "TypeScript"]
+  # A repo primarily some other language but containing a JS/TS web app is
+  # judged by the web-app detector below, not primary_language alone; record
+  # both signals and let screen_candidates.py apply the combined rule.
+  language_mixed_allowed: true         # "Mixed JS/TS" counts
+  requires_package_json: true
+
+  # --- Source size (relevant LOC; see excluded-paths.txt) ------------------
+  min_relevant_source_loc: 500
+  max_relevant_source_loc: 100000
+
+  # --- Attribution ---------------------------------------------------------
+  requires_detectable_claude_attribution: true       # treated cohort only
+  requires_substantial_attribution: true             # treated cohort only
+  requires_reachable_attributed_commit: true         # ancestor of default HEAD
+
+  # --- Deployment (gate; partitions into tracks) ---------------------------
+  # For the DEPLOYED track only. repository_only track sets this false.
+  requires_verifiable_public_deployment: true
+  requires_deployment_currently_accessible: true
+  requires_deployment_repository_match: true
+
+# -----------------------------------------------------------------------------
+# Web-application detection.
+# At least one primary indicator OR (package.json AND >=1 secondary indicator)
+# must be present, AND the project must not be a library/CLI/SDK-only package
+# (see exclusion-rules.yaml project_type_exclusions).
+# -----------------------------------------------------------------------------
+web_application_detection:
+  primary_indicators:
+    - "next.config.js"
+    - "next.config.mjs"
+    - "next.config.ts"
+    - "vite.config.js"
+    - "vite.config.ts"
+    - "nuxt.config.js"
+    - "nuxt.config.ts"
+    - "svelte.config.js"
+    - "astro.config.mjs"
+    - "remix.config.js"
+    - "angular.json"
+    - "src/App.jsx"
+    - "src/App.tsx"
+    - "src/main.tsx"
+    - "src/main.jsx"
+    - "server.js"
+    - "server.ts"
+  secondary_indicators_dirs:
+    - "pages/"
+    - "app/"
+    - "src/routes/"
+    - "src/pages/"
+    - "public/"
+    - "api/"
+  dependency_indicators:                # presence in package.json dependencies
+    frontend: ["react", "react-dom", "vue", "svelte", "@angular/core", "solid-js", "preact"]
+    meta_framework: ["next", "nuxt", "@remix-run/react", "astro", "@sveltejs/kit", "gatsby"]
+    backend: ["express", "@nestjs/core", "fastify", "koa", "hapi", "hono"]
+  # A repo that is ONLY a backend/API (no frontend) still counts as a web
+  # application for this study (application_type = backend_or_api).
+  backend_only_counts_as_web_app: true
+
+# -----------------------------------------------------------------------------
+# Application-type taxonomy (recorded per repo)
+# -----------------------------------------------------------------------------
+application_types:
+  - frontend_only
+  - frontend_plus_baas          # frontend + backend-as-a-service (Supabase/Firebase)
+  - fullstack_monolith
+  - separate_frontend_backend
+  - backend_or_api
+  - serverless_web
+
+# -----------------------------------------------------------------------------
+# Substantial Claude-attribution qualifying rules (ANY ONE qualifies).
+# Values mirror study-config.attribution_qualification; kept here so this file
+# is self-contained for reviewers of the eligibility logic.
+# -----------------------------------------------------------------------------
+substantial_attribution_rules:
+  rule_A:
+    description: "At least 3 substantive Claude Code-attributed commits."
+    min_substantive_commits: 3
+  rule_B:
+    description: "At least one attributed commit adds/substantially modifies >= 500 relevant source lines."
+    min_relevant_lines_in_one_commit: 500
+  rule_C:
+    description: "At least 2 substantive attributed commits AND attributed commits are >= 10% of non-merge commits."
+    min_substantive_commits: 2
+    min_attributed_share_of_non_merge: 0.10
+  rule_D:
+    description: "The initial application implementation is Claude-attributed and contains >= 500 relevant source lines."
+    initial_impl_attributed: true
+    initial_impl_min_relevant_lines: 500
+  record_qualifying_rules: true        # store WHICH rule(s) matched
+
+# -----------------------------------------------------------------------------
+# Definition of a SUBSTANTIVE attributed commit.
+# A commit is substantive when it changes meaningful application SOURCE code.
+# A commit is NON-substantive when its changes are limited to the paths/types
+# below (these are also excluded from the relevant-LOC deltas).
+# -----------------------------------------------------------------------------
+substantive_commit:
+  # A commit counts as substantive if it touches >= min_source_lines_changed
+  # lines in files that are NOT in the non_substantive set.
+  min_source_lines_changed: 10
+  non_substantive_only_changes:
+    - "README and Markdown files"
+    - "badges"
+    - "comment-only changes"
+    - "formatting-only changes (whitespace/prettier)"
+    - "lock files only (package-lock.json, yarn.lock, pnpm-lock.yaml)"
+    - "generated files"
+    - "snapshots"
+    - "compiled output"
+    - "minified assets"
+    - "dependency version metadata only"
+    - "GitHub issue/PR templates"
+    - ".gitignore / editorconfig / license only"
+  # Paths that never count toward source-line deltas (mirror excluded-paths.txt)
+  path_exclusions_file: "config/excluded-paths.txt"
+
+# -----------------------------------------------------------------------------
+# Reachability check for attributed commits.
+# The qualifying attributed commit(s) must be ancestors of the frozen default
+# branch HEAD, so the attributed work is actually in the current application.
+#   git merge-base --is-ancestor <ATTRIBUTED_SHA> <DEFAULT_BRANCH_HEAD>
+# Exit code 0 => ancestor => reachable.
+# -----------------------------------------------------------------------------
+reachability:
+  method: "git merge-base --is-ancestor"
+  require_at_least_one_reachable_qualifying_commit: true
+
+# -----------------------------------------------------------------------------
+# Control cohort inclusion (mirrors the above MINUS attribution requirements).
+# Discovery must not use any attribution signal, and repos with ANY detectable
+# attribution signal are excluded from the control pool.
+# -----------------------------------------------------------------------------
+control_inclusion:
+  same_repository_requirements: true
+  requires_detectable_claude_attribution: false
+  must_have_zero_attribution_signals: true
+  requires_verifiable_public_deployment: true    # for the deployed control track

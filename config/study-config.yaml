@@ -1,0 +1,290 @@
+# =============================================================================
+# study-config.yaml
+# Central configuration for:
+#   "Security Analysis of 500 Deployed Web Applications with Detectable
+#    Claude Code-Attributed Development"
+#
+# This file is the single source of truth for study-wide parameters. Scripts
+# read it; its SHA-256 is recorded in the environment manifest so any run can
+# be tied to the exact configuration that produced it.
+#
+# NOTE ON TERMINOLOGY (enforced across all reports):
+#   Repositories are "Claude Code-attributed", NOT "Claude-generated".
+#   The frame is "repositories with publicly DETECTABLE Claude Code attribution".
+#   Attribution can be disabled/removed/customised, so this sample does not
+#   represent every project developed with Claude Code.
+# =============================================================================
+
+study:
+  title: "Security Analysis of 500 Deployed Web Applications with Detectable Claude Code-Attributed Development"
+  short_name: "claude-deployed-security-study"
+  version: "0.1.0"
+  principal_reviewer_count: 1          # DECISION 4: single human reviewer (self).
+                                       # No inter-rater kappa; documented as a limitation.
+  timezone_for_records: "UTC"          # all timestamps stored in UTC (ISO-8601, 'Z')
+
+# -----------------------------------------------------------------------------
+# Reproducibility
+# -----------------------------------------------------------------------------
+reproducibility:
+  random_seed: 20260711                # fixed seed for ALL sampling operations
+  # GitHub's search index is mutable: re-running the live search later yields a
+  # different candidate set. The reproducibility artifact is the SAVED raw search
+  # JSON under data/raw/, NOT the live query. Scripts must never overwrite raw/.
+  raw_outputs_are_immutable: true
+  atomic_writes: true                  # write to *.tmp then os.replace()
+  checksum_algorithm: "sha256"
+
+# -----------------------------------------------------------------------------
+# Search / collection window
+# Claude Code entered research preview on 2025-02-24; window closes 2026-06-30.
+# The window is CLOSED (today is after the end date), so the search space is
+# historically stable apart from repo deletions/renames.
+# -----------------------------------------------------------------------------
+search_window:
+  start_date: "2025-02-24"
+  end_date:   "2026-06-30"
+  # Adaptive slicing: start monthly; whenever a slice returns >= saturation_threshold
+  # results (API truncation risk), recurse into finer windows (bi-weekly -> weekly
+  # -> daily) until every slice is below the threshold. See docs/candidate-discovery-plan.md
+  monthly_slicing: true
+  adaptive_subslicing: true
+  saturation_threshold: 950            # gh commit search hard-caps at 1000/query
+
+# -----------------------------------------------------------------------------
+# Attribution signals (the detectable Claude Code fingerprints)
+# Do NOT hardcode a model name ("Claude Sonnet 5") — the label varies. The
+# stable anchors are the noreply email and the two fixed phrases/trailers.
+# -----------------------------------------------------------------------------
+attribution:
+  high_confidence_signals:
+    - 'noreply@anthropic.com'          # Co-Authored-By: Claude ... <noreply@anthropic.com>
+    - 'Generated with Claude Code'
+  supporting_signals:
+    - 'Claude-Session:'                # some web/remote sessions
+  readme_supporting_phrases:          # supporting evidence ONLY, never sufficient alone
+    - 'Built using Claude Code'
+    - 'Developed with Claude Code'
+    - 'Generated with Claude Code'
+  # Signals that are INSUFFICIENT on their own (tooling, not authorship evidence):
+  insufficient_signals:
+    - 'Claude API'
+    - 'Anthropic SDK'
+    - 'CLAUDE.md'
+    - '@anthropic-ai/sdk'
+
+# -----------------------------------------------------------------------------
+# Study tracks (DECISION 1: split into two cohorts)
+# The pipeline is identical up to the deployment gate. The deployment gate
+# partitions eligible repositories into two analysis tracks so that a shortfall
+# in verifiable live deployments does not collapse the whole study.
+# -----------------------------------------------------------------------------
+tracks:
+  deployed:
+    description: >
+      STRICT track. Requires a currently-accessible, repository-matched public
+      deployment (deployment evidence Level A/B/C). This is the headline sample.
+    requires_live_deployment: true
+    target_n: 500
+    # If fewer than target_n qualify, REPORT the available number + reasons.
+    # Never relax eligibility to reach 500 (see inclusion-rules.yaml).
+    allow_shortfall: true
+  repository_only:
+    description: >
+      RELAXED track. Same repository-side eligibility, but the live-deployment
+      requirement is dropped. Absorbs eligible repos that fail only the
+      deployment gate, and is analysed as a separate sub-study.
+    requires_live_deployment: false
+    target_n: 500
+    allow_shortfall: true
+
+# -----------------------------------------------------------------------------
+# Control cohort (DECISION 2: matched non-Claude comparison group)
+# Non-Claude-attributed JS/TS web apps, run through the IDENTICAL pipeline,
+# matched to the treated sample. Enables cautious Claude-vs-baseline framing.
+# Matching is documented and pre-registered; not causal.
+# -----------------------------------------------------------------------------
+control_cohort:
+  enabled: true
+  description: >
+    Public JS/TS web-application repositories with NO detectable Claude Code
+    attribution, matched to the treated (Claude-attributed) sample.
+  # Discovery must NOT use any attribution signal; must apply the SAME
+  # web-app / language / LOC / not-fork / not-archived / deployment filters.
+  exclude_any_attribution_signal: true
+  matching:
+    strategy: "nearest_neighbour"      # coarsened/nearest-neighbour matching
+    ratio: 1                            # 1 control per treated unit (1:1)
+    covariates:
+      - source_loc_bucket              # same size stratum
+      - framework
+      - deployment_provider
+      - repo_age_months_bucket
+      - application_type
+    caliper_notes: >
+      Exact match on framework + size stratum where possible; nearest-neighbour
+      on repo age within a caliper. Unmatched treated units are reported, not
+      dropped from the primary descriptive analysis.
+  target_n_per_track: 500              # attempt 1:1; report achieved match rate
+
+# -----------------------------------------------------------------------------
+# Control-cohort discovery partitioning (repository search).
+# GitHub repo search hard-caps at 1000 results/query AND ranks by popularity, so
+# each (language x date-window) slice is FURTHER partitioned by STAR BUCKETS to
+# avoid silent truncation and popularity/recency skew. Without this, a saturated
+# slice returns only the most-starred repos. See docs/candidate-discovery-plan.md §7.
+# Buckets are contiguous and exhaustive (0 .. >=2500); a saturated bucket still
+# recurses via the adaptive date sub-slicing.
+# -----------------------------------------------------------------------------
+control_discovery:
+  languages: ["TypeScript", "JavaScript"]
+  star_buckets:
+    - "0"
+    - "1..4"
+    - "5..24"
+    - "25..99"
+    - "100..499"
+    - "500..2499"
+    - ">=2500"
+
+# -----------------------------------------------------------------------------
+# Candidate pool sizing
+# The deployment gate is the dominant filter. Pool size is an OUTPUT of a
+# measured funnel, not a fixed input. Begin with a first batch, measure the
+# per-stage pass rate, then back-calculate the pool needed to land the targets.
+# -----------------------------------------------------------------------------
+candidate_pool:
+  first_batch_target: 1000             # measure funnel pass-rates on this batch first
+  initial_pool_hint: [2000, 3000]      # plan's original guidance; likely too low
+  escalation_hint: [10000, 30000]      # realistic if deployment pass-rate is low
+  funnel_reporting: true               # emit a CONSORT-style funnel table + figure
+
+# -----------------------------------------------------------------------------
+# Substantial-attribution qualifying rules (any one qualifies). Details and the
+# definition of a "substantive" commit live in inclusion-rules.yaml.
+# -----------------------------------------------------------------------------
+attribution_qualification:
+  rule_A_min_substantive_commits: 3
+  rule_B_min_lines_single_commit: 500
+  rule_C_min_attributed_share: 0.10
+  rule_C_min_substantive_commits: 2
+  rule_D_initial_impl_min_lines: 500
+
+# -----------------------------------------------------------------------------
+# Relevant source-LOC bounds (see excluded-paths.txt for what is NOT counted)
+# -----------------------------------------------------------------------------
+source_loc:
+  min: 500
+  max: 100000
+  tool_priority: ["tokei", "cloc"]     # prefer tokei; fall back to cloc
+
+# -----------------------------------------------------------------------------
+# Size strata for stratified sampling
+# -----------------------------------------------------------------------------
+size_strata:
+  small:  { min: 500,   max: 4999 }
+  medium: { min: 5000,  max: 19999 }
+  large:  { min: 20000, max: 100000 }
+
+# -----------------------------------------------------------------------------
+# Claude involvement bands (DECISION 3: EXPLORATORY only)
+# The involvement variable measures DETECTABLE attributed-commit share, i.e.
+# attribution RETENTION, not actual Claude usage intensity. Any correlation is
+# exploratory and cannot speak to how much Claude was actually used.
+# -----------------------------------------------------------------------------
+involvement:
+  analysis_status: "exploratory"       # never labelled confirmatory
+  variable_note: "proxy for attribution retention, not usage intensity"
+  bands:
+    low:    { min_substantive: 1,  max_substantive: 4 }
+    medium: { min_substantive: 5,  max_substantive: 19 }
+    high:   { min_substantive: 20, or_min_share: 0.25 }
+
+# -----------------------------------------------------------------------------
+# Per-owner cap in the final sample (diversity guard)
+# -----------------------------------------------------------------------------
+sampling:
+  max_repos_per_owner: 2
+  enforce_exact_n: true                # assert len(sample) == target_n
+
+# -----------------------------------------------------------------------------
+# Anonymous ID scheme
+# -----------------------------------------------------------------------------
+anonymization:
+  treated_id_prefix: "CLR"             # CLR-0001 .. CLR-0500 (Claude repo)
+  control_id_prefix: "CTR"             # CTR-0001 ..           (control repo)
+  id_width: 4
+  # Public URL "hashing" is weak anonymity (reversible by guessing). Deployment
+  # URLs are NOT published; if any hash is published it must be a keyed HMAC
+  # whose key stays in data/private/. Default: do not publish URL hashes.
+  publish_deployment_url_hash: false
+  hmac_key_location: "data/private/anonymization-hmac.key"
+
+# -----------------------------------------------------------------------------
+# Statistics
+# -----------------------------------------------------------------------------
+statistics:
+  proportion_ci_method: "wilson"       # not normal-approx (rare events)
+  multiple_comparison_correction: "benjamini_hochberg"
+  # Density metrics are computed PER CATEGORY with category-appropriate
+  # denominators (never a single pooled findings/1kLOC across secrets + deps +
+  # code). See analyse_results.py.
+  density_denominators:
+    code_findings: "source_loc"
+    dependency_findings: "dependency_count"
+    secret_findings: "source_loc"
+  primary_outcome: "has_high_or_critical_confirmed_finding"
+  count_outcome: "deduplicated_finding_count"
+  count_model: "negative_binomial"     # LOC as offset/exposure; check overdispersion
+  report_effect_sizes: true
+  report_confidence_intervals: true
+  no_causal_claims: true
+
+# -----------------------------------------------------------------------------
+# Confound covariates that MUST be controlled (temporal + size confounds)
+# -----------------------------------------------------------------------------
+covariates_required:
+  - source_loc
+  - dependency_count
+  - framework
+  - application_type
+  - repo_age_months          # dependency CVEs accumulate with calendar time
+  - last_push_age_days       # scanner vuln DB is "as of scan date"
+  - deployment_provider
+  - github_actions_present
+  - docker_present
+
+# -----------------------------------------------------------------------------
+# Paths (relative to study root)
+# -----------------------------------------------------------------------------
+paths:
+  raw_search: "data/raw/github-search"
+  raw_search_control: "data/raw/github-search-control"
+  interim: "data/interim"
+  processed: "data/processed"
+  private: "data/private"
+  public: "data/public"
+  candidates_clone: "repositories/candidates"
+  selected_clone: "repositories/selected"
+  results_raw: "results/raw"
+  results_redacted: "results/redacted"
+  results_normalized: "results/normalized"
+  results_deduplicated: "results/deduplicated"
+  results_validation: "results/validation"
+  tables: "results/tables"
+  figures: "results/figures"
+  reports: "results/reports"
+  logs: "logs"
+
+# -----------------------------------------------------------------------------
+# Hard ethical/safety switches (enforced in code; changing these is a protocol
+# deviation that must be recorded). See README "Ethical restrictions".
+# -----------------------------------------------------------------------------
+safety:
+  never_execute_repository_code: true
+  never_run_install_build_test: true
+  never_validate_credentials: true
+  never_penetration_test_deployments: true
+  live_deployment_checks_only: ["HEAD /", "GET / (fallback)"]
+  disable_network_during_repo_scan: true      # after scanner DBs are pre-fetched
+  upload_source_to_external_ai: false

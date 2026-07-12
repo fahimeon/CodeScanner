@@ -1,0 +1,45 @@
+[
+  {
+    "sha": "1111111111111111111111111111111111111111",
+    "url": "https://github.com/octo/alpha-app/commit/1111111111111111111111111111111111111111",
+    "repository": {
+      "fullName": "octo/alpha-app",
+      "url": "https://github.com/octo/alpha-app"
+    },
+    "commit": {
+      "message": "feat: add dashboard\n\nCo-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>",
+      "author": { "date": "2025-03-05T10:00:00Z" }
+    }
+  },
+  {
+    "sha": "2222222222222222222222222222222222222222",
+    "url": "https://github.com/octo/alpha-app/commit/2222222222222222222222222222222222222222",
+    "repository": {
+      "fullName": "octo/alpha-app",
+      "url": "https://github.com/octo/alpha-app"
+    },
+    "commit": {
+      "message": "fix: auth bug\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+      "author": { "date": "2025-03-12T09:30:00Z" }
+    }
+  },
+  {
+    "sha": "3333333333333333333333333333333333333333",
+    "url": "https://github.com/hubber/beta-site/commit/3333333333333333333333333333333333333333",
+    "repository": {
+      "owner": { "login": "hubber" },
+      "name": "beta-site",
+      "url": "https://github.com/hubber/beta-site"
+    },
+    "commit": {
+      "message": "chore: init\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+      "committer": { "date": "2025-03-20T14:00:00Z" }
+    }
+  },
+  {
+    "sha": null,
+    "url": "https://github.com/broken/no-sha/commit/none",
+    "repository": { "fullName": "broken/no-sha" },
+    "commit": { "message": "should be skipped (no sha)" }
+  }
+]

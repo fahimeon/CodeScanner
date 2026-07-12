@@ -1,0 +1,39 @@
+# Collector image: GitHub discovery + repository metadata + safe cloning.
+# Contains git, GitHub CLI, Python. Does NOT contain build toolchains for
+# repository languages (we never build/install repository code).
+FROM python:3.11-slim-bookworm
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    GIT_TERMINAL_PROMPT=0 \
+    GIT_LFS_SKIP_SMUDGE=1
+
+# --- system deps: git + gh (GitHub CLI) + minimal utils ---
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git ca-certificates curl gnupg \
+    && install -m 0755 -d /etc/apt/keyrings \
+    && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+        | dd of=/etc/apt/keyrings/githubcli-archive-keyring.gpg \
+    && chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+        > /etc/apt/sources.list.d/github-cli.list \
+    && apt-get update && apt-get install -y --no-install-recommends gh \
+    && rm -rf /var/lib/apt/lists/*
+
+# --- python analysis deps ---
+COPY requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
+
+# --- non-root user ---
+RUN useradd --uid 10001 --create-home --shell /usr/sbin/nologin study
+USER 10001:10001
+
+WORKDIR /study
+# Harden git for untrusted repositories at clone time.
+RUN git config --global core.hooksPath /home/study/.empty-hooks \
+    && mkdir -p /home/study/.empty-hooks \
+    && git config --global core.symlinks false \
+    && git config --global protocol.ext.allowed never \
+    && git config --global protocol.file.allowed never
+
+CMD ["python", "--version"]

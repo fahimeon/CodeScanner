@@ -1,0 +1,263 @@
+# =============================================================================
+# scanner-config.yaml
+# Static-analysis scanner stack, pinning, offline sequencing, and isolation.
+#
+# GOLDEN RULE: scanners analyse the cloned repository ONLY. Repository code is
+# NEVER executed; installation/build/test/deploy commands are NEVER run. Scans
+# run in ephemeral, non-root containers with resource limits and (after DBs are
+# pre-fetched) outbound network disabled.
+#
+# Version/ruleset/DB fields below are placeholders resolved at pin-time by
+# check_environment.py + a one-time "prepare" step, then frozen into the
+# environment manifest. Do not edit pinned values by hand after freezing.
+# =============================================================================
+
+scanners:
+  gitleaks:
+    enabled: true
+    role: "secrets"
+    version: "PIN_AT_RUNTIME"
+    config: "gitleaks default ruleset (record version)"
+    scan_targets:
+      working_tree: true
+      git_history: true                # requires full clone for history (see clone strategy)
+    redact: true                       # never store/print plaintext secret values
+    notes: >
+      History secrets and working-tree secrets are reported SEPARATELY; the
+      headline 'repository has exposed secret' metric uses working-tree state.
+
+  semgrep:
+    enabled: true
+    role: "source_code"
+    edition: "community"               # Semgrep Community Edition / OSS rules only
+    version: "PIN_AT_RUNTIME"
+    # Rulesets must be PRE-FETCHED and pinned by commit/hash before going offline.
+    rulesets:
+      - "p/javascript"
+      - "p/typescript"
+      - "p/react"
+      - "p/nextjs"
+      - "p/nodejs"
+      - "p/expressjs"
+      - "p/security-audit"
+      - "p/secrets"                    # overlaps gitleaks; kept for cross-scanner overlap RQ
+      - "p/owasp-top-ten"
+    ruleset_lock:
+      pinned_commit: "PIN_AT_RUNTIME"
+      pinned_hash: "PIN_AT_RUNTIME"
+      local_cache_dir: "config/semgrep-rules-cache"   # snapshot fetched before offline scan
+    output: "sarif"                    # also emit json
+    timeout_seconds: 900
+
+  trivy:
+    enabled: true
+    role: "dependencies_config_iac_secrets"
+    version: "PIN_AT_RUNTIME"
+    # This list is AUTHORITATIVE and MUST stay identical to the trivy invocation
+    # in docker/scanner-entrypoint.sh and the README. License scanning is a
+    # COMPLIANCE concern, not a security measurement in this study, so it is NOT
+    # enabled. Do not add "license" unless license findings become a measured outcome.
+    scanners: ["vuln", "misconfig", "secret"]
+    targets: ["filesystem"]            # fs scan; NEVER 'trivy image' builds
+    db:
+      vuln_db_version: "PIN_AT_RUNTIME"
+      java_db: false
+      pre_fetch_offline: true          # `trivy fs --download-db-only` then run --offline-scan
+    scan:
+      dockerfile: true
+      iac: true
+      github_actions: false            # GitHub Actions risks are detected by ZIZMOR,
+                                       # not Trivy. `trivy fs` has no material GHA
+                                       # coverage, so it is not credited for that category.
+      dependency_lockfiles: true
+      do_not_build_images: true
+      do_not_install: true
+    output: "json"
+    timeout_seconds: 900
+
+  osv_scanner:
+    enabled: true
+    role: "dependencies"
+    version: "PIN_AT_RUNTIME"
+    db:
+      osv_db_date: "PIN_AT_RUNTIME"    # record advisory DB snapshot date
+      offline_after_prefetch: true
+    targets: ["manifests", "lockfiles"]
+    do_not_install: true
+    output: "json"
+    timeout_seconds: 600
+    notes: >
+      Overlaps Trivy on dependency CVEs (expected). Dedup by
+      repo+package+version+advisory. Overlap is measured (RQ11), not treated as
+      independent confirmation.
+
+  zizmor:
+    enabled: true
+    role: "github_actions"
+    version: "PIN_AT_RUNTIME"
+    scan_path: ".github/workflows/"
+    audits:
+      offline: true                    # run offline audits by default
+      online: false                    # online audits (e.g. known-vuln action lookups)
+                                       # need a token+network; disabled during isolated
+                                       # scan. Reduced coverage is recorded, not hidden.
+    output: "sarif"
+    timeout_seconds: 300
+
+  codeql:
+    enabled: false                     # OPTIONAL enhanced-analysis track. NOT part of
+                                       # the primary five-scanner pipeline and NEVER a
+                                       # dependency of it. Enable deliberately; results
+                                       # are stored and reported SEPARATELY.
+    role: "source_code_taint"
+    track: "enhanced_analysis"
+    languages: ["javascript", "typescript"]   # single JS/TS database
+    query_suites:
+      - "codeql/javascript-security-extended"
+      - "codeql/javascript-security-and-quality"
+    database_build: "none_required"    # JS/TS DB is built from source; NO code execution
+    do_not_execute_repository_code: true
+    output: "sarif"
+    results_dir: "results/raw/codeql"  # kept separate from primary-pipeline results
+    note: >
+      Adds interprocedural / cross-file taint that Semgrep Community Edition
+      lacks, materially upgrading recall for XSS / SQLi / SSRF / path-traversal /
+      command-injection / code-injection. Because it changes detection
+      sensitivity, CodeQL findings are reported in a separate section and are
+      NEVER merged into primary-pipeline prevalence numbers.
+
+# -----------------------------------------------------------------------------
+# Pipeline composition
+# The PRIMARY pipeline is the five scanners below; ALL headline measurements come
+# from these. CodeQL is an OPTIONAL, separately-reported enhancement and is never
+# a dependency of the primary pipeline. `make scan` runs only the primary five.
+# -----------------------------------------------------------------------------
+pipeline:
+  primary: ["gitleaks", "semgrep", "trivy", "osv_scanner", "zizmor"]
+  enhanced_optional: ["codeql"]
+  enhanced_results:
+    store_under: "results/raw/codeql"
+    report_separately: true
+    never_merge_into_primary: true
+
+# -----------------------------------------------------------------------------
+# Offline sequencing (MANDATORY ORDER)
+#   1. Pre-fetch + pin all rulesets and vuln DBs WITH network.
+#   2. Snapshot them locally; record versions/hashes/dates in the manifest.
+#   3. Disable outbound network.
+#   4. Run every repository scan offline against the pinned snapshots.
+# -----------------------------------------------------------------------------
+offline_sequencing:
+  prefetch_then_pin: true
+  disable_network_after_prefetch: true
+  record_db_versions_in_manifest: true
+
+# -----------------------------------------------------------------------------
+# Safe clone strategy (per repository). See scripts/clone_selected_repositories.py.
+# -----------------------------------------------------------------------------
+clone:
+  # Two clone shapes: a working-tree checkout at the frozen commit for most
+  # scanners, and (only for gitleaks history) a full-history clone.
+  working_tree:
+    partial: true                      # --filter=blob:none, then checkout frozen SHA
+    depth_full_history: false
+  history_for_gitleaks:
+    full_history: true                 # required so gitleaks can scan removed-then-committed secrets
+  git_safety:
+    disable_hooks: true                # cross-platform: point core.hooksPath at empty dir (NOT /dev/null on Windows)
+    hooks_path_empty_dir: ".empty-hooks"
+    disable_terminal_prompt: true      # GIT_TERMINAL_PROMPT=0
+    disable_symlinks: true             # core.symlinks=false
+    forbid_ext_protocol: true          # protocol.ext.allowed=never
+    skip_submodules: true
+    forbid_lfs_smudge: true            # GIT_LFS_SKIP_SMUDGE=1
+  limits:
+    clone_timeout_seconds: 300
+    max_repo_size_mb: 2048
+    max_file_count: 200000
+    max_single_file_mb: 50
+    reject_symlink_escape: true
+    reject_path_traversal: true
+
+# -----------------------------------------------------------------------------
+# Container isolation (per-scan). Scans run in the Linux scanner container even
+# though the host is Windows, so cgroup limits and non-root are meaningful.
+# -----------------------------------------------------------------------------
+isolation:
+  run_in_container: true
+  user: "nonroot"
+  mount_repo_read_only: true
+  mount_docker_socket: false
+  network: "none"                      # after DB prefetch
+  host_network: false
+  tmpfs_scratch: true
+  limits:
+    cpus: "2.0"
+    memory: "4g"
+    pids: 512
+    nofile: 4096
+    scan_timeout_seconds: 1200
+  auto_cleanup: true
+
+# -----------------------------------------------------------------------------
+# Commands that must NEVER run (defensive denylist; enforced in entrypoint)
+# -----------------------------------------------------------------------------
+forbidden_commands:
+  - "npm install"
+  - "npm ci"
+  - "yarn install"
+  - "pnpm install"
+  - "npm run build"
+  - "npm test"
+  - "npm start"
+  - "docker build"
+  - "docker compose"
+  - "pip install"
+  - "make"
+  - "bash setup.sh"
+  - "./install.sh"
+
+# -----------------------------------------------------------------------------
+# Scanner execution record fields (per scanner x repository)
+# -----------------------------------------------------------------------------
+execution_record_fields:
+  - repository_id
+  - commit_sha
+  - scanner
+  - scanner_version
+  - ruleset_version
+  - container_image_digest
+  - configuration_hash
+  - start_time
+  - end_time
+  - duration_seconds
+  - exit_code
+  - timeout_status
+  - success_status
+  - files_analysed
+  - finding_count
+  - error_message
+
+execution_statuses:
+  - SUCCESS
+  - SUCCESS_WITH_FINDINGS
+  - NO_FINDINGS
+  - TIMEOUT
+  - UNSUPPORTED
+  - PARSER_ERROR
+  - SCANNER_ERROR
+  - RESOURCE_LIMIT
+  - CLONE_ERROR
+# A scanner FAILURE is never recorded as zero findings.
+treat_failure_as_zero_findings: false
+
+# -----------------------------------------------------------------------------
+# Pilot before full run
+# -----------------------------------------------------------------------------
+pilot:
+  enabled: true
+  size: 10
+  select_from: "frozen_500"
+  seed: 20260711
+  must_pass_before_full_scan: true
+  do_not_change_sample_on_findings: true

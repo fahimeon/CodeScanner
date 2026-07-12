@@ -1,0 +1,169 @@
+# =============================================================================
+# exclusion-rules.yaml
+# Structured exclusion codes + the detection heuristics for each. Every
+# excluded candidate is recorded with its code(s) and evidence. Exclusion
+# records are NEVER deleted (data/processed/excluded-candidates.csv).
+#
+# Detection heuristics are intentionally conservative: when a heuristic is
+# ambiguous, the candidate is flagged MANUAL_REVIEW rather than auto-excluded,
+# so eligibility is never silently weakened or over-tightened.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Repository-related exclusion codes
+# -----------------------------------------------------------------------------
+repository_codes:
+  EX_ARCHIVED:                 "Repository is archived."
+  EX_FORK:                     "Repository is a GitHub fork."
+  EX_EMPTY_REPOSITORY:         "Repository has no commits / no tree."
+  EX_NO_DEFAULT_BRANCH:        "Repository has no resolvable default branch."
+  EX_NOT_JS_TS:                "Not primarily JavaScript/TypeScript and no JS/TS web app detected."
+  EX_NO_PACKAGE_JSON:          "No package.json present."
+  EX_NOT_WEB_APP:              "No web-application indicators; project is not a web app."
+  EX_INSUFFICIENT_LOC:         "Relevant source LOC < 500."
+  EX_EXCESSIVE_LOC:            "Relevant source LOC > 100000."
+  EX_WEAK_ATTRIBUTION:         "No detectable Claude Code attribution meeting substantiality rules."
+  EX_NON_SUBSTANTIVE_CLAUDE_CHANGE: "Attributed commits touch only non-substantive files."
+  EX_UNREACHABLE_CLAUDE_COMMIT: "No qualifying attributed commit is an ancestor of default HEAD."
+  EX_INTENTIONALLY_VULNERABLE: "Intentionally vulnerable / deliberately insecure application."
+  EX_SECURITY_LAB:             "CTF, security lab, exploit demo, or malware project."
+  EX_DOCUMENTATION_ONLY:       "Documentation-only project."
+  EX_LIBRARY_ONLY:             "Library/SDK/CLI without a deployed web application."
+  EX_TUTORIAL_ONLY:            "Tutorial copy without substantial original development."
+  EX_DUPLICATE:                "Exact/near-duplicate of another selected repository."
+  EX_CLONE_FAILED:             "Safe clone/checkout failed (size, timeout, hostile content)."
+
+# -----------------------------------------------------------------------------
+# Deployment-related exclusion codes (apply to the DEPLOYED track)
+# -----------------------------------------------------------------------------
+deployment_codes:
+  EX_NO_DEPLOYMENT_URL:            "No deployment URL discoverable."
+  EX_DEPLOYMENT_UNVERIFIABLE:      "Deployment could not be verified as belonging to the repo."
+  EX_DEPLOYMENT_DEAD:              "Deployment dead (404/410/DNS)."
+  EX_DEPLOYMENT_TIMEOUT:           "Deployment did not respond within limits on both checks."
+  EX_DEPLOYMENT_PROVIDER_PROTECTED: "Provider-protected preview (password/SSO wall, not the app)."
+  EX_DEPLOYMENT_PREVIEW_ONLY:      "Only unstable PR/preview deployment available."
+  EX_DEPLOYMENT_UNRELATED:         "URL resolves to an unrelated site."
+  EX_DEPLOYMENT_PLACEHOLDER:       "Placeholder/coming-soon page, not the application."
+  EX_DEPLOYMENT_PARKED_DOMAIN:     "Parked domain."
+  EX_DEPLOYMENT_SERVER_ERROR:      "Persistent 5xx with no application content."
+  EX_DEPLOYMENT_REQUIRES_INVITATION: "Invitation-only / not publicly reachable."
+  EX_DEPLOYMENT_REPOSITORY_MISMATCH: "Deployment does not correspond to the repository."
+
+# NOTE: a repository excluded ONLY by a deployment_code remains eligible for the
+# repository_only track (it fails the deployment gate, not repository eligibility).
+
+# -----------------------------------------------------------------------------
+# Project-type exclusions (semantic — applied during classification)
+# -----------------------------------------------------------------------------
+project_type_exclusions:
+  reasons:
+    - "prompt collection"
+    - "Claude API wrapper without Claude Code contribution evidence"
+    - "Claude Code configuration collection"
+    - "CLAUDE.md collection"
+    - "SDK"
+    - "reusable library without a deployed application"
+    - "command-line utility"
+    - "documentation-only repository"
+    - "empty starter template"
+    - "tutorial copy without substantial original development"
+  # package.json signals that a project is a LIBRARY/CLI (not a web app):
+  library_cli_signals_in_package_json:
+    - has_bin_field: true            # "bin" -> CLI
+    - private_false_and_main_only: true   # publishable lib with "main"/"exports", no app entry
+    - files_field_points_to_dist_only: true
+
+# -----------------------------------------------------------------------------
+# Heuristics for the "intentionally vulnerable / security lab" family.
+# Match against repo name, description, topics, and README headings.
+# ANY strong match => flag for MANUAL_REVIEW before applying EX_* (avoid
+# excluding a legitimate app that merely mentions "security").
+# -----------------------------------------------------------------------------
+intentionally_vulnerable_signals:
+  name_or_topic_terms:
+    - "vulnerable"
+    - "vuln-app"
+    - "dvwa"
+    - "juice-shop"
+    - "damn-vulnerable"
+    - "insecure-by-design"
+    - "hackme"
+    - "hack-me"
+    - "ctf"
+    - "capture-the-flag"
+    - "security-lab"
+    - "pentest-lab"
+    - "exploit-demo"
+    - "malware"
+    - "vulnhub"
+    - "webgoat"
+    - "goatapp"
+  readme_phrases:
+    - "intentionally vulnerable"
+    - "deliberately insecure"
+    - "for educational security purposes"
+    - "do not deploy to production"
+    - "contains known vulnerabilities on purpose"
+  decision: "flag_manual_review_then_exclude_if_confirmed"
+
+documentation_only_signals:
+  # >X% of non-boilerplate content is docs AND relevant source LOC < min
+  markdown_dominant_ratio: 0.90
+  no_web_app_indicators: true
+  decision: "exclude_if_no_web_app_and_docs_dominant"
+
+tutorial_copy_signals:
+  name_or_topic_terms:
+    - "tutorial"
+    - "example"
+    - "demo-following"
+    - "course-project"
+    - "clone-tutorial"
+    - "learn-"
+  # Tutorial NAME alone is not sufficient; require ALSO near-duplicate of a
+  # known template/tutorial scaffold (see detect_duplicates.py) OR trivial LOC.
+  require_additional_evidence: true
+  decision: "flag_manual_review"
+
+# -----------------------------------------------------------------------------
+# Precedence: apply cheap/authoritative repository codes first (archived, fork,
+# empty, language, package.json), then LOC, then attribution, then project-type,
+# then deployment, then duplicate. Record ALL applicable codes, not just the first.
+# -----------------------------------------------------------------------------
+precedence:
+  - EX_ARCHIVED
+  - EX_FORK
+  - EX_EMPTY_REPOSITORY
+  - EX_NO_DEFAULT_BRANCH
+  - EX_NO_PACKAGE_JSON
+  - EX_NOT_JS_TS
+  - EX_NOT_WEB_APP
+  - EX_INSUFFICIENT_LOC
+  - EX_EXCESSIVE_LOC
+  - EX_INTENTIONALLY_VULNERABLE
+  - EX_SECURITY_LAB
+  - EX_DOCUMENTATION_ONLY
+  - EX_LIBRARY_ONLY
+  - EX_TUTORIAL_ONLY
+  - EX_WEAK_ATTRIBUTION
+  - EX_NON_SUBSTANTIVE_CLAUDE_CHANGE
+  - EX_UNREACHABLE_CLAUDE_COMMIT
+  - EX_DUPLICATE
+  - EX_CLONE_FAILED
+  - EX_NO_DEPLOYMENT_URL
+  - EX_DEPLOYMENT_UNVERIFIABLE
+  - EX_DEPLOYMENT_DEAD
+  - EX_DEPLOYMENT_TIMEOUT
+  - EX_DEPLOYMENT_PROVIDER_PROTECTED
+  - EX_DEPLOYMENT_PREVIEW_ONLY
+  - EX_DEPLOYMENT_UNRELATED
+  - EX_DEPLOYMENT_PLACEHOLDER
+  - EX_DEPLOYMENT_PARKED_DOMAIN
+  - EX_DEPLOYMENT_SERVER_ERROR
+  - EX_DEPLOYMENT_REQUIRES_INVITATION
+  - EX_DEPLOYMENT_REPOSITORY_MISMATCH
+
+records:
+  never_delete_exclusions: true
+  store_evidence_for_each_code: true

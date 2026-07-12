@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "claude-deployed-security-study"
+version = "0.1.0"
+description = "Reproducible static-security-analysis pipeline for deployed web applications with detectable Claude Code-attributed development."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+keywords = [
+    "security", "static-analysis", "mining-software-repositories",
+    "empirical-software-engineering", "claude-code", "reproducible-research",
+]
+
+# Runtime deps are pinned in requirements.txt (installed via pip); this section
+# is intentionally minimal so the repo installs cleanly for tooling.
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-cov>=5.0", "ruff>=0.5", "black>=24.0"]
+
+[tool.setuptools]
+packages = []          # scripts are run directly, not imported as a package
+py-modules = []
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = "-ra -q"
+markers = [
+    "unit: fast, isolated unit tests using synthetic fixtures only",
+    "no_network: test must not make any network call",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["repositories", "data", "results", "config/semgrep-rules-cache"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "S"]   # includes flake8-bandit (S) for our own code
+ignore = ["S603", "S607"]                  # subprocess calls are intentional & controlled
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+extend-exclude = "repositories|data|results"
