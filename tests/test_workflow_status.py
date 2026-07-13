@@ -32,5 +32,7 @@ def test_update_readme_without_markers_returns_false(tmp_path):
 def test_status_reflects_filesystem():
     rows = ws.statuses()
     built = {n for n, _, ok in rows if ok}
-    assert "check_environment.py" in built          # exists
-    assert "generate_reports.py" not in built        # not yet implemented
+    assert "check_environment.py" in built          # exists on disk
+    # A script that does NOT exist is reported as planned, not built.
+    assert ("this_script_does_not_exist.py", "n/a", False) not in rows
+    assert all((ws.SCRIPTS_DIR / n).is_file() == ok for n, _, ok in rows)
