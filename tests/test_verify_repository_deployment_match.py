@@ -70,6 +70,38 @@ def test_no_deployment_record_repo_only():
 
 
 # --------------------------------------------------------------------------- #
+# Deployment commit relationship (audit #9)
+# --------------------------------------------------------------------------- #
+def test_compute_commit_relationship_all_categories():
+    # No deployed SHA -> UNKNOWN (the common case).
+    assert vm.compute_commit_relationship(None, "abc") == "UNKNOWN"
+    assert vm.compute_commit_relationship("abc", None) == "UNKNOWN"
+    # Exact.
+    assert vm.compute_commit_relationship("abc", "abc") == "EXACT_COMMIT"
+    # Without an ancestry oracle, non-exact stays UNKNOWN (never guessed).
+    assert vm.compute_commit_relationship("dep", "ref") == "UNKNOWN"
+
+    # dep is an ancestor of ref.
+    anc = lambda a, b: (a, b) == ("dep", "ref")
+    assert vm.compute_commit_relationship("dep", "ref", anc) == "DEPLOYED_COMMIT_IS_ANCESTOR"
+    # ref is an ancestor of dep -> dep is a descendant.
+    desc = lambda a, b: (a, b) == ("ref", "dep")
+    assert vm.compute_commit_relationship("dep", "ref", desc) == "DEPLOYED_COMMIT_IS_DESCENDANT"
+    # neither -> different branch.
+    assert vm.compute_commit_relationship("dep", "ref", lambda a, b: False) == "DIFFERENT_BRANCH"
+
+
+def test_finalize_match_sets_exact_commit_relationship():
+    v = _verify(best_evidence_level="A", deployment_sha="sha1")
+    r = vm.finalize_match("o/a", v, {"repository_eligible": True}, reference_sha="sha1")
+    assert r["deployment_commit_relationship"] == "EXACT_COMMIT"
+    # Different SHA, no oracle -> UNKNOWN (honest).
+    v2 = _verify(best_evidence_level="A", deployment_sha="shaX")
+    r2 = vm.finalize_match("o/a", v2, {"repository_eligible": True}, reference_sha="sha1")
+    assert r2["deployment_commit_relationship"] == "UNKNOWN"
+
+
+# --------------------------------------------------------------------------- #
 # Orchestrator + funnel + writers
 # --------------------------------------------------------------------------- #
 def test_match_all_and_funnel(tmp_path):

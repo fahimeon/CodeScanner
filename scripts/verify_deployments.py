@@ -191,6 +191,9 @@ def verify_one(full_name: str, discovery: dict, http_fn, cfg: dict) -> dict:
         "page_title": title,
         "repo_link_found": repo_link_found(result.get("body_snippet"), full_name),
         "name_in_page": name_in_page(title_body, full_name),
+        # Carried from discovery for the commit-relationship calculation (audit #9).
+        "deployment_sha": discovery.get("primary_deployment_sha"),
+        "deployment_ref": discovery.get("primary_deployment_ref"),
     }
 
 

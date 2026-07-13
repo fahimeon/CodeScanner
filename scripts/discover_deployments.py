@@ -154,24 +154,29 @@ def discover_for_repo(full_name: str, meta: dict, files: list[str], contents: di
     """Build the deployment-candidate record from all discovery sources."""
     raw: list[dict] = []
 
-    def add(url: Optional[str], source: str) -> None:
+    def add(url: Optional[str], source: str, **extra) -> None:
         if not url:
             return
         url = url.strip().rstrip('.,);]"\'')
         if not url.lower().startswith(("http://", "https://")):
             return
-        raw.append({"url": url, "source": source,
-                    "evidence_level": source_evidence(source),
-                    "provider": classify_provider(url, providers)})
+        cand = {"url": url, "source": source,
+                "evidence_level": source_evidence(source),
+                "provider": classify_provider(url, providers)}
+        cand.update({k: v for k, v in extra.items() if v is not None})
+        raw.append(cand)
 
-    # GitHub deployments API (statuses carry environment_url).
+    # GitHub deployments API (retain deployment sha/ref/environment/timestamps).
     for dep in gh_data.get("deployments", []) or []:
         env = (dep.get("environment") or "").lower()
         for st in dep.get("statuses", []) or []:
             if st.get("state") == "success" and st.get("environment_url"):
                 src = "production_environment_url" if ("prod" in env or env == "") \
                     else "github_deployments_api"
-                add(st["environment_url"], src)
+                add(st["environment_url"], src,
+                    deployment_sha=dep.get("sha"), deployment_ref=dep.get("ref"),
+                    deployment_environment=dep.get("environment"),
+                    status_created_at=st.get("created_at"), url_source=src)
     # GitHub Pages.
     pages = gh_data.get("pages") or {}
     if isinstance(pages, dict) and pages.get("html_url"):
@@ -208,6 +213,10 @@ def discover_for_repo(full_name: str, meta: dict, files: list[str], contents: di
         "best_evidence_level": best["evidence_level"] if best else None,
         "primary_deployment_url": best["url"] if best else None,
         "primary_provider": best["provider"] if best else None,
+        # Deployment commit metadata (usually only present for Level-A candidates).
+        "primary_deployment_sha": best.get("deployment_sha") if best else None,
+        "primary_deployment_ref": best.get("deployment_ref") if best else None,
+        "primary_deployment_environment": best.get("deployment_environment") if best else None,
         "candidate_count": len(candidates),
         "deployment_candidates": candidates,
     }
