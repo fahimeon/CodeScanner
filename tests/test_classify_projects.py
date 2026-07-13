@@ -31,6 +31,13 @@ def test_has_dir_indicator():
 # --------------------------------------------------------------------------- #
 # Tech indicators
 # --------------------------------------------------------------------------- #
+def test_count_js_ts_files_excludes_vendored():
+    files = {"src/a.ts", "src/b.tsx", "src/c.js", "types/x.d.ts",
+             "node_modules/react/index.js", "dist/bundle.js", "README.md"}
+    # a.ts, b.tsx, c.js count; d.ts excluded; node_modules/dist excluded.
+    assert cp.count_js_ts_files(files) == 3
+
+
 def test_detect_tech_indicators():
     files = {".github/workflows/ci.yml", "Dockerfile", "tsconfig.json",
              "src/index.ts", "package.json"}

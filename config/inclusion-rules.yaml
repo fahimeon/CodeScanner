@@ -23,6 +23,12 @@ hard_requirements:
   # both signals and let screen_candidates.py apply the combined rule.
   language_mixed_allowed: true         # "Mixed JS/TS" counts
   requires_package_json: true
+  # STRICT JS/TS (audit #11): a repo is NOT accepted as JS/TS merely because it is
+  # a web app with a package.json. Require MEASURED JS/TS source presence — either
+  # the primary language is JS/TS, or there are >= min_js_ts_source_files JS/TS
+  # source files, or >= min_js_ts_loc measured JS/TS lines (tokei breakdown).
+  min_js_ts_source_files: 3
+  min_js_ts_loc: 100
 
   # --- Source size (relevant LOC; see excluded-paths.txt) ------------------
   min_relevant_source_loc: 500
