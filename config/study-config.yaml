@@ -16,7 +16,10 @@
 # =============================================================================
 
 study:
-  title: "Security Analysis of 500 Deployed Web Applications with Detectable Claude Code-Attributed Development"
+  # TARGET POLICY (audit #12): "up_to_target" — sample UP TO target_n per track and
+  # REPORT any shortfall; never weaken eligibility to reach the number. The title
+  # therefore does not assert a fixed 500 (see sampling.target_policy).
+  title: "Security Analysis of Deployed Web Applications with Detectable Claude Code-Attributed Development"
   short_name: "claude-deployed-security-study"
   version: "0.1.0"
   principal_reviewer_count: 1          # DECISION 4: single human reviewer (self).
@@ -122,9 +125,14 @@ control_cohort:
       - repo_age_months_bucket
       - application_type
     caliper_notes: >
-      Exact match on framework + size stratum where possible; nearest-neighbour
-      on repo age within a caliper. Unmatched treated units are reported, not
-      dropped from the primary descriptive analysis.
+      Exact match on framework + size stratum + application type + provider class;
+      nearest-neighbour on repo age within a predeclared caliper. For the DEPLOYED
+      treated cohort, controls MUST ALSO have a verified deployment. Unmatched
+      treated units are reported (with reason), never silently relaxed.
+    age_caliper_months: 6                 # predeclared repo-age caliper (audit #13)
+    require_control_deployment_for_deployed: true
+    exact_covariates: ["size_bucket", "framework", "application_type", "deployment_provider"]
+    balance_covariates: ["repo_age_months", "relevant_source_loc"]  # SMD reported pre/post
   target_n_per_track: 500              # attempt 1:1; report achieved match rate
 
 # -----------------------------------------------------------------------------
@@ -205,7 +213,10 @@ involvement:
 # -----------------------------------------------------------------------------
 sampling:
   max_repos_per_owner: 2
-  enforce_exact_n: true                # assert len(sample) == target_n
+  # "up_to_target" = select up to target_n and report shortfall (never weaken
+  # criteria). "exact_or_refuse" = refuse selection unless target_n is reached.
+  target_policy: "up_to_target"
+  enforce_exact_n: false               # up_to_target does not assert len == target_n
 
 # -----------------------------------------------------------------------------
 # Anonymous ID scheme
