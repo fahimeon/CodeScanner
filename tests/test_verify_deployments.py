@@ -54,18 +54,6 @@ def test_network_errors():
 
 
 # --------------------------------------------------------------------------- #
-# robots.txt respect
-# --------------------------------------------------------------------------- #
-def test_robots_allows():
-    ua = "claude-deployed-security-study/0.1"
-    assert vd.robots_allows(None, ua) is True                       # no robots -> allow
-    assert vd.robots_allows("User-agent: *\nDisallow:", ua) is True  # empty disallow
-    assert vd.robots_allows("User-agent: *\nDisallow: /", ua) is False
-    # A rule for a different agent does not apply to us.
-    assert vd.robots_allows("User-agent: Googlebot\nDisallow: /", ua) is True
-
-
-# --------------------------------------------------------------------------- #
 # Title / correspondence-signal extraction
 # --------------------------------------------------------------------------- #
 def test_extract_title_and_signals():

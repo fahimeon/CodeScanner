@@ -111,7 +111,19 @@ availability_check:
   submit_forms: false
   download_assets: false
   user_agent: "claude-deployed-security-study/0.1 (research; non-invasive availability check; contact via repository)"
-  respect_robots_txt: true
+  # The /robots.txt pre-request was REMOVED (audit P0 #1): the only permitted live
+  # interaction is a single root HEAD and, when needed, one bounded root GET on the
+  # discovered deployment URL. No auxiliary crawling (robots.txt or otherwise).
+  fetch_robots_txt: false
+  # SSRF controls enforced in scripts/net_safety.py (validated per request + redirect).
+  ssrf_protection:
+    allow_schemes: ["http", "https"]
+    reject_userinfo: true
+    reject_localhost_and_dotlocal: true
+    reject_non_public_ips: true          # loopback/private/link-local/multicast/reserved/unspecified
+    validate_every_redirect_target: true
+    pin_connection_to_validated_ip: true
+    single_monotonic_total_deadline: true
 
 # -----------------------------------------------------------------------------
 # Deployment status classification
