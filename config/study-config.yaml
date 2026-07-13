@@ -267,6 +267,7 @@ paths:
   public: "data/public"
   candidates_clone: "repositories/candidates"
   selected_clone: "repositories/selected"
+  history_clone: "repositories/history"       # bare mirror clones for Gitleaks history
   results_raw: "results/raw"
   results_redacted: "results/redacted"
   results_normalized: "results/normalized"

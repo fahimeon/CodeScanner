@@ -38,8 +38,21 @@ echo "[entrypoint] scanner=$SCANNER repo=$REPO_PATH -> $OUTPUT_PATH"
 
 case "$SCANNER" in
   gitleaks)
-    # Working-tree scan (no git required for --no-git); history handled by a
-    # separate invocation from the host with a full clone.
+    # WORKING-TREE scan (--no-git): this is the HEADLINE "currently exposed
+    # secret" signal. Git history is scanned separately (gitleaks-history).
+    exec gitleaks detect \
+        --source "$REPO_PATH" \
+        --no-git \
+        --no-banner \
+        --redact \
+        --report-format json \
+        --report-path "$OUTPUT_PATH" \
+        --exit-code 0 "$@"
+    ;;
+
+  gitleaks-history)
+    # FULL GIT-HISTORY scan over a bare mirror clone (removed-then-committed
+    # secrets). Reported SEPARATELY from the working-tree headline metric.
     exec gitleaks detect \
         --source "$REPO_PATH" \
         --no-banner \

@@ -37,7 +37,8 @@ except Exception:  # pragma: no cover
 STUDY_ROOT = common.STUDY_ROOT
 
 CLONE_FIELDS = ["repository_full_name", "anonymous_id", "status", "checked_out_sha",
-                "size_mb", "file_count", "largest_file_mb", "exclusion_code", "reasons"]
+                "size_mb", "file_count", "largest_file_mb", "exclusion_code", "reasons",
+                "history_status", "history_reasons"]
 
 
 # =========================================================================== #
@@ -57,6 +58,31 @@ def build_working_tree_clone_args(url: str, dest: str, hooks_dir: str) -> list[s
 def build_checkout_args(ref: str) -> list[str]:
     # --force materializes the tree; hooks/symlinks already disabled at clone.
     return ["checkout", "--force", ref]
+
+
+def build_mirror_clone_args(url: str, dest: str, hooks_dir: str) -> list[str]:
+    """Bare MIRROR clone (all history) for Gitleaks history scanning. Same
+    hardening switches; --mirror implies bare so no working tree is materialized."""
+    return [
+        "-c", "protocol.ext.allowed=never",
+        "-c", "core.symlinks=false",
+        "-c", f"core.hooksPath={hooks_dir}",
+        "clone", "--mirror", url, dest,
+    ]
+
+
+def check_history_guards(git_size_bytes: int, largest_pack_bytes: int,
+                         limits: dict) -> tuple[bool, list[str]]:
+    """Object/pack-size guards for the history mirror (defends against hostile
+    or pathologically large histories)."""
+    reasons: list[str] = []
+    max_git = limits.get("max_repo_size_mb", 2048) * 1024 * 1024
+    max_pack = limits.get("max_single_file_mb", 50) * 1024 * 1024
+    if git_size_bytes > max_git:
+        reasons.append(f"history_size>{limits.get('max_repo_size_mb')}mb")
+    if largest_pack_bytes > max_pack:
+        reasons.append(f"pack>{limits.get('max_single_file_mb')}mb")
+    return (not reasons), reasons
 
 
 def check_clone_guards(size_bytes: int, file_count: int, largest_file_bytes: int,
@@ -135,9 +161,13 @@ CloneFn = Callable[[str, str, Optional[str], Path], dict]
 
 
 def clone_all(selected: list[dict], clone_root: Path, log_path: Path,
-              clone_fn: CloneFn, limits: dict) -> list[dict]:
+              clone_fn: CloneFn, limits: dict, *,
+              history_clone_fn: Optional[CloneFn] = None,
+              history_root: Optional[Path] = None) -> list[dict]:
     """Clone each selected repo at its FROZEN sha. Identity (URL + frozen SHA) is
-    read DIRECTLY from the selected sample — never from mutable interim metadata."""
+    read DIRECTLY from the selected sample — never from mutable interim metadata.
+    When `history_clone_fn` is given, ALSO make a bare mirror clone for Gitleaks
+    history and record its (separate) status."""
     common.ensure_dir(clone_root)
     records: list[dict] = []
     seen: set[str] = set()
@@ -165,6 +195,16 @@ def clone_all(selected: list[dict], clone_root: Path, log_path: Path,
         except Exception as exc:
             result = {"status": "ERROR", "error": f"{type(exc).__name__}: {exc}"}
         rec = build_clone_record(full, row.get("anonymous_id"), result, limits, frozen_sha)
+
+        # Separate history mirror clone (Gitleaks history) — recorded independently.
+        if history_clone_fn is not None and rec["status"] == "OK":
+            hdest = (history_root or clone_root.parent / "history") / vca._safe_name(full)
+            try:
+                hres = history_clone_fn(full, url, frozen_sha, hdest)
+            except Exception as exc:
+                hres = {"status": "ERROR", "error": f"{type(exc).__name__}: {exc}"}
+            rec.update(build_history_record(full, hres, frozen_sha, limits))
+
         records.append(rec)
         _log(log_path, full, rec["status"], rec.get("checked_out_sha"))
     return records
@@ -224,6 +264,52 @@ def make_git_clone_fn(git_path: str, clone_root: Path, clone_timeout: int = 300)
     return _fn
 
 
+def build_history_record(full: str, result: dict, frozen_sha: str, limits: dict) -> dict:
+    """History-mirror outcome for a repo: guards + frozen-commit presence."""
+    if result.get("status") != "OK":
+        return {"history_status": "HISTORY_CLONE_ERROR",
+                "history_reasons": result.get("error", "mirror clone failed")}
+    ok, reasons = check_history_guards(result.get("git_size_bytes", 0),
+                                       result.get("largest_pack_bytes", 0), limits)
+    if not result.get("has_frozen_commit"):
+        ok = False
+        reasons.append("frozen_commit_absent_in_history")
+    return {"history_status": "OK" if ok else "HISTORY_CLONE_ERROR",
+            "history_reasons": ";".join(reasons)}
+
+
+def make_git_mirror_clone_fn(git_path: str, history_root: Path, clone_timeout: int = 300):
+    """Bare MIRROR clone for Gitleaks history; verifies the frozen commit is
+    present and measures .git size + largest pack (no checkout, no code)."""
+    import shutil
+    common.ensure_dir(history_root)
+    hooks_dir = history_root / ".empty-hooks"
+    common.ensure_dir(hooks_dir)
+    env = vca._git_env()
+
+    def _run(args, timeout):
+        import subprocess
+        return subprocess.run([git_path, *args], capture_output=True, text=True,
+                              timeout=timeout, check=False, env=env)
+
+    def _fn(full: str, url: str, frozen_sha: str, dest: Path) -> dict:
+        if not vca._is_within(history_root, dest):
+            return {"status": "ERROR", "error": "path_escape"}
+        if dest.exists():
+            shutil.rmtree(dest, ignore_errors=True)
+        c = _run(build_mirror_clone_args(url, str(dest), str(hooks_dir)), clone_timeout)
+        if c.returncode != 0:
+            return {"status": "ERROR", "error": f"mirror: {c.stderr.strip()[:200]}"}
+        present = _run(["-C", str(dest), "cat-file", "-e", f"{frozen_sha}^{{commit}}"], 30)
+        git_size = sum(f.stat().st_size for f in dest.rglob("*") if f.is_file())
+        packs = list((dest / "objects" / "pack").glob("*.pack")) if (dest / "objects").exists() else []
+        largest_pack = max((p.stat().st_size for p in packs), default=0)
+        return {"status": "OK", "git_size_bytes": git_size, "largest_pack_bytes": largest_pack,
+                "has_frozen_commit": present.returncode == 0}
+
+    return _fn
+
+
 # =========================================================================== #
 # main
 # =========================================================================== #
@@ -262,10 +348,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         print("ERROR: git not found on PATH.", file=sys.stderr)
         return 2
     clone_root = STUDY_ROOT / cfg["paths"]["selected_clone"]
+    history_root = STUDY_ROOT / cfg["paths"].get("history_clone", "repositories/history")
     clone_fn = make_git_clone_fn(git, clone_root, clone_timeout)
+    history_clone_fn = make_git_mirror_clone_fn(git, history_root, clone_timeout)
     log_path = STUDY_ROOT / cfg["paths"]["logs"] / "clone_selected.jsonl"
 
-    records = clone_all(selected, clone_root, log_path, clone_fn, limits)
+    records = clone_all(selected, clone_root, log_path, clone_fn, limits,
+                        history_clone_fn=history_clone_fn, history_root=history_root)
     write_manifest(records, processed / "clone-manifest.json", processed / "clone-manifest.csv")
 
     ok = sum(1 for r in records if r["status"] == "OK")

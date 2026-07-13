@@ -259,7 +259,8 @@ treat_failure_as_zero_findings: false
 # (SCANNER_ERROR). A "findings" exit code MUST NOT be treated as an error.
 # -----------------------------------------------------------------------------
 exit_semantics:
-  gitleaks:    { ok: [0], findings: [] }        # entrypoint forces --exit-code 0
+  gitleaks:         { ok: [0], findings: [] }   # working-tree scan; entrypoint forces --exit-code 0
+  gitleaks-history: { ok: [0], findings: [] }   # git-history scan (separate mirror clone)
   semgrep:     { ok: [0], findings: [1] }        # 1 = results found; >=2 = error (no --error flag)
   trivy:       { ok: [0], findings: [] }         # no --exit-code set -> always 0 on success
   osv-scanner: { ok: [0], findings: [1] }        # 1 = vulnerabilities found; 127/128 = error

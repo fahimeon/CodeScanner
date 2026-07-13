@@ -140,6 +140,65 @@ def test_clone_refuses_on_sha_mismatch(tmp_path):
     assert "sha_mismatch" in records[0]["reasons"]
 
 
+# --- P0 #6: Gitleaks history (separate mirror clone) ------------------------ #
+def test_mirror_clone_args_and_history_guards():
+    args = cl.build_mirror_clone_args("https://github.com/o/r", "/dest", "/hooks")
+    joined = " ".join(args)
+    assert "--mirror" in args and "protocol.ext.allowed=never" in joined
+    limits = {"max_repo_size_mb": 10, "max_single_file_mb": 5}
+    assert cl.check_history_guards(1_000_000, 1_000_000, limits) == (True, [])
+    bad, reasons = cl.check_history_guards(20 * 1024 * 1024, 6 * 1024 * 1024, limits)
+    assert bad is False and any("history_size" in r for r in reasons) and any("pack" in r for r in reasons)
+
+
+def test_build_history_record_requires_frozen_commit():
+    limits = {"max_repo_size_mb": 2048, "max_single_file_mb": 50}
+    ok = cl.build_history_record("o/r", {"status": "OK", "git_size_bytes": 1000,
+                                         "largest_pack_bytes": 100, "has_frozen_commit": True},
+                                 "sha1", limits)
+    assert ok["history_status"] == "OK"
+    missing = cl.build_history_record("o/r", {"status": "OK", "git_size_bytes": 1000,
+                                              "largest_pack_bytes": 100, "has_frozen_commit": False},
+                                      "sha1", limits)
+    assert missing["history_status"] == "HISTORY_CLONE_ERROR"
+    assert "frozen_commit_absent_in_history" in missing["history_reasons"]
+
+
+def test_gitleaks_history_fixture_parses_as_findings(tmp_path):
+    fixture = (Path(__file__).resolve().parent / "fixtures" / "scanner_output" /
+               "gitleaks-history.json")
+    text = fixture.read_text(encoding="utf-8")
+    assert "REDACTED" in text and "Commit" in text          # historical + redacted
+    out = tmp_path / "raw" / "gitleaks-history" / "o__r.json"
+
+    def run_fn(cmd):
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(text, encoding="utf-8")
+        return 0, "", ""
+
+    rec = sr.run_one("gitleaks-history", "o/r", "CLR-0001", "sha1",
+                     "/scan/repositories/o__r", out,
+                     "/scan/results/raw/gitleaks-history/o__r.json", [], "img",
+                     {"limits": {}}, run_fn, accepted_exit_codes={0})
+    assert rec["status"] == "SUCCESS_WITH_FINDINGS" and rec["finding_count"] == 1
+
+
+def test_clone_all_records_history_status(tmp_path):
+    def clone_fn(full, url, ref, dest):
+        return {"status": "OK", "size_bytes": 1000, "file_count": 5,
+                "largest_file_bytes": 500, "checked_out_sha": ref}
+
+    def history_fn(full, url, ref, dest):
+        return {"status": "OK", "git_size_bytes": 2000, "largest_pack_bytes": 500,
+                "has_frozen_commit": True}
+
+    selected = [{"repository_full_name": "o/a", "repository_url": "https://github.com/o/a",
+                 "frozen_commit_sha": "sha1"}]
+    records = cl.clone_all(selected, tmp_path / "sel", tmp_path / "log.jsonl", clone_fn,
+                           _LIMITS, history_clone_fn=history_fn, history_root=tmp_path / "hist")
+    assert records[0]["status"] == "OK" and records[0]["history_status"] == "OK"
+
+
 def test_clone_refuses_missing_frozen_sha(tmp_path):
     selected = [{"repository_full_name": "o/a"}]      # no frozen_commit_sha
     called = {"n": 0}

@@ -32,8 +32,8 @@ STUDY_ROOT = common.STUDY_ROOT
 SCANNER_IMAGE = "claude-study-scanner:latest"
 
 # scanner -> raw output file extension
-OUTPUT_EXT = {"gitleaks": "json", "semgrep": "sarif", "trivy": "json",
-              "osv-scanner": "json", "zizmor": "sarif"}
+OUTPUT_EXT = {"gitleaks": "json", "gitleaks-history": "json", "semgrep": "sarif",
+              "trivy": "json", "osv-scanner": "json", "zizmor": "sarif"}
 
 EXEC_FIELDS = ["repository_full_name", "anonymous_id", "scanner", "commit_sha",
                "scanner_version", "ruleset_or_db_hash", "image_digest",
@@ -128,7 +128,8 @@ def count_osv(text: str) -> Optional[int]:
 
 
 FINDING_PARSERS = {
-    "gitleaks": count_gitleaks, "semgrep": count_semgrep, "trivy": count_trivy,
+    "gitleaks": count_gitleaks, "gitleaks-history": count_gitleaks,
+    "semgrep": count_semgrep, "trivy": count_trivy,
     "osv-scanner": count_osv, "zizmor": count_zizmor,
 }
 
@@ -166,6 +167,7 @@ def build_run_context(scanner: str, ready_marker: Optional[dict]) -> dict:
     that every raw output is stamped with and validated against."""
     m = ready_marker or {}
     versions = m.get("pinned_scanner_versions", {}) or {}
+    version_key = "gitleaks" if scanner == "gitleaks-history" else scanner
     if scanner == "semgrep":
         rd_hash = m.get("semgrep_ruleset_hash")
     elif scanner == "trivy":
@@ -175,7 +177,7 @@ def build_run_context(scanner: str, ready_marker: Optional[dict]) -> dict:
     else:
         rd_hash = ""                       # gitleaks/zizmor: no external ruleset/DB
     return {
-        "scanner_version": versions.get(scanner),
+        "scanner_version": versions.get(version_key),
         "ruleset_or_db_hash": rd_hash,
         "image_digest": m.get("image_digest") or m.get("image_id"),
         "configuration_hash": m.get("configuration_hash") or common.config_bundle_hash(),
@@ -308,15 +310,18 @@ def _quarantine(output_host: Path, sidecar: Path, results_raw: Path, reasons: li
 
 def run_all(scanner: str, clone_manifest: list[dict], run_fn: RunFn, *,
             image: Optional[str] = None, docker: str = "docker",
-            ready_marker: Optional[dict] = None, pilot_ids: Optional[set] = None) -> list[dict]:
+            ready_marker: Optional[dict] = None, pilot_ids: Optional[set] = None,
+            repos_root: Optional[Path] = None) -> list[dict]:
     """Run one scanner over every successfully-cloned repository, with immutable
-    append-only records + per-repo sidecars and validated/quarantined reuse."""
+    append-only records + per-repo sidecars and validated/quarantined reuse.
+    `repos_root` overrides the clone root (e.g. the history mirror for
+    gitleaks-history); results are written under results/raw/<scanner>/."""
     cfg = common.load_study_config()
     scanner_cfg = common.load_yaml(common.CONFIG_DIR / "scanner-config.yaml")
     isolation = _isolation(scanner_cfg)
     ctx = build_run_context(scanner, ready_marker)
     image = image or (ctx.get("image_digest") or SCANNER_IMAGE)
-    repos_root = STUDY_ROOT / cfg["paths"]["selected_clone"]
+    repos_root = repos_root or (STUDY_ROOT / cfg["paths"]["selected_clone"])
     results_raw = STUDY_ROOT / cfg["paths"]["results_raw"] / scanner
     events_path = results_raw / "execution-records.jsonl"       # append-only, never overwritten
     log_path = STUDY_ROOT / cfg["paths"]["logs"] / f"run_{scanner.replace('-', '_')}.jsonl"
@@ -440,8 +445,13 @@ def cli_main(scanner: str, argv: Optional[list[str]] = None) -> int:
                         if r.get("status") == "OK" and r.get("anonymous_id"))
         pilot_ids = set(ok_ids[:size])
 
+    # Gitleaks history scans the bare MIRROR clones, not the working tree.
+    repos_root = None
+    if scanner == "gitleaks-history":
+        repos_root = STUDY_ROOT / cfg["paths"].get("history_clone", "repositories/history")
+
     records = run_all(scanner, clone_manifest, run_fn, docker=docker,
-                      ready_marker=marker, pilot_ids=pilot_ids)
+                      ready_marker=marker, pilot_ids=pilot_ids, repos_root=repos_root)
 
     from collections import Counter
     statuses = Counter(r["status"] for r in records)
