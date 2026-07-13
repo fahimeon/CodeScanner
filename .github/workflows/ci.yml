@@ -1,0 +1,79 @@
+name: ci
+
+# Fully OFFLINE / SYNTHETIC checks only. This workflow MUST NOT collect
+# third-party repositories, contact any deployment URL, build/run the scanner
+# image, or scan external projects. It only compiles, lints, validates config,
+# checks docs/status consistency, sanity-checks the Docker entrypoint, and runs
+# the synthetic offline unit + integration tests.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt || true
+          pip install pytest pyyaml ruff
+
+      - name: Byte-compile all scripts
+        run: python -m compileall -q scripts
+
+      - name: Lint (syntax + undefined names only)
+        run: ruff check --select E9,F63,F7,F82,F821 scripts tests
+
+      - name: Validate YAML config
+        run: |
+          python - <<'PY'
+          import glob, yaml, sys
+          bad = False
+          for f in glob.glob("config/*.yaml"):
+              try:
+                  yaml.safe_load(open(f, encoding="utf-8"))
+                  print("ok:", f)
+              except Exception as e:
+                  print("FAIL:", f, e); bad = True
+          sys.exit(1 if bad else 0)
+          PY
+
+      - name: Docker entrypoint safety checks
+        run: |
+          python - <<'PY'
+          import sys, re
+          t = open("docker/scanner-entrypoint.sh", encoding="utf-8").read()
+          forbidden = ["npm install", "npm ci", "yarn install", "pnpm install",
+                       "npm run build", "npm test", "npm start", "pip install",
+                       "docker build", "docker compose"]
+          hits = [c for c in forbidden if c in t]
+          # The entrypoint must refuse build commands, never execute them.
+          exec_hits = [c for c in hits if not re.search(r"\*?" + re.escape(c.split()[0]), t)]
+          if exec_hits:
+              print("FAIL: entrypoint references build commands:", exec_hits); sys.exit(1)
+          assert "REFUSED" in t, "entrypoint missing its refusal guard"
+          print("entrypoint safety OK")
+          PY
+
+      - name: Docs/status consistency (README generated from workflow_status)
+        run: |
+          python scripts/workflow_status.py --update-readme
+          git diff --exit-code -- README.md \
+            || (echo "README status block is stale; run: python scripts/workflow_status.py --update-readme" && exit 1)
+
+      - name: Unit + synthetic integration tests (offline)
+        run: python -m pytest -q
