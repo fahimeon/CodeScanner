@@ -76,20 +76,48 @@ def test_build_clone_record_flags_oversize_as_ex_clone_failed():
     assert rec["status"] == "CLONE_ERROR" and rec["exclusion_code"] == "EX_CLONE_FAILED"
 
 
-def test_clone_all_uses_metadata_sha_and_records(tmp_path):
+_LIMITS = {"max_repo_size_mb": 2048, "max_file_count": 200000, "max_single_file_mb": 50}
+
+
+def test_clone_reads_frozen_sha_from_selected_sample(tmp_path):
+    # Identity comes from the SELECTED sample, not interim metadata (audit P0 #5).
     def clone_fn(full, url, ref, dest):
-        assert ref == "frozensha123"           # from metadata default_branch_head_sha
+        assert ref == "frozensha123" and url == "https://github.com/o/a"
         return {"status": "OK", "size_bytes": 1000, "file_count": 5,
                 "largest_file_bytes": 500, "checked_out_sha": ref}
 
-    selected = [{"repository_full_name": "o/a", "anonymous_id": "CLR-0001"}]
-    metadata = {"o/a": {"repository_url": "https://github.com/o/a",
-                        "default_branch_head_sha": "frozensha123"}}
-    limits = {"max_repo_size_mb": 2048, "max_file_count": 200000, "max_single_file_mb": 50}
-    records = cl.clone_all(selected, metadata, tmp_path / "sel", tmp_path / "log.jsonl",
-                           clone_fn, limits)
-    assert records[0]["status"] == "OK"
-    assert records[0]["checked_out_sha"] == "frozensha123"
+    selected = [{"repository_full_name": "o/a", "anonymous_id": "CLR-0001",
+                 "repository_url": "https://github.com/o/a", "frozen_commit_sha": "frozensha123"}]
+    records = cl.clone_all(selected, tmp_path / "sel", tmp_path / "log.jsonl", clone_fn, _LIMITS)
+    assert records[0]["status"] == "OK" and records[0]["checked_out_sha"] == "frozensha123"
+
+
+def test_clone_refuses_on_sha_mismatch(tmp_path):
+    # Checkout landed on a different commit than the frozen SHA -> refuse.
+    def clone_fn(full, url, ref, dest):
+        return {"status": "OK", "size_bytes": 1000, "file_count": 5,
+                "largest_file_bytes": 500, "checked_out_sha": "DIFFERENTsha456"}
+
+    selected = [{"repository_full_name": "o/a", "repository_url": "https://github.com/o/a",
+                 "frozen_commit_sha": "frozensha123"}]
+    records = cl.clone_all(selected, tmp_path / "sel", tmp_path / "log.jsonl", clone_fn, _LIMITS)
+    assert records[0]["status"] == "CLONE_ERROR"
+    assert records[0]["exclusion_code"] == "EX_CLONE_FAILED"
+    assert "sha_mismatch" in records[0]["reasons"]
+
+
+def test_clone_refuses_missing_frozen_sha(tmp_path):
+    selected = [{"repository_full_name": "o/a"}]      # no frozen_commit_sha
+    called = {"n": 0}
+
+    def clone_fn(full, url, ref, dest):
+        called["n"] += 1
+        return {"status": "OK"}
+
+    records = cl.clone_all(selected, tmp_path / "sel", tmp_path / "log.jsonl", clone_fn, _LIMITS)
+    assert records[0]["status"] == "CLONE_ERROR"
+    assert "missing_frozen_commit_sha" in records[0]["reasons"]
+    assert called["n"] == 0                           # never attempted the clone
 
 
 # =========================================================================== #

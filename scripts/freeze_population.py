@@ -35,6 +35,10 @@ STUDY_ROOT = common.STUDY_ROOT
 POPULATION_FIELDS = [
     "repository_full_name",
     "owner",
+    "repository_url",
+    "frozen_commit_sha",
+    "metadata_snapshot_hash",
+    "configuration_hash",
     "repository_eligible",
     "deployed_eligible",
     "track",
@@ -57,14 +61,32 @@ POPULATION_FIELDS = [
 # =========================================================================== #
 # PURE FUNCTIONS
 # =========================================================================== #
+def metadata_snapshot_hash(meta: dict) -> str:
+    """Deterministic hash of the exact metadata record frozen for this repo."""
+    return common.sha256_hex(json.dumps(meta or {}, sort_keys=True, ensure_ascii=False))
+
+
+def config_bundle_hash() -> str:
+    """Hash of ALL config files, so a frozen record is tied to the exact config."""
+    parts = []
+    for path in sorted(common.CONFIG_DIR.iterdir()):
+        if path.is_file():
+            parts.append(f"{path.name}:{common.sha256_hex(path.read_bytes())}")
+    return common.sha256_hex("\n".join(parts))
+
+
 def build_population_record(full: str, screen: dict, track: dict, meta: dict,
                             cls: dict, loc: dict, contrib: dict,
-                            provider: Optional[str]) -> dict:
+                            provider: Optional[str], config_hash: str = "") -> dict:
     screen, track = screen or {}, track or {}
     meta, cls, loc, contrib = meta or {}, cls or {}, loc or {}, contrib or {}
     return {
         "repository_full_name": full,
         "owner": full.split("/", 1)[0],
+        "repository_url": meta.get("repository_url") or f"https://github.com/{full}",
+        "frozen_commit_sha": meta.get("default_branch_head_sha"),
+        "metadata_snapshot_hash": metadata_snapshot_hash(meta),
+        "configuration_hash": config_hash,
         "repository_eligible": bool(screen.get("repository_eligible")),
         "deployed_eligible": bool(track.get("final_deployment_eligible")),
         "track": track.get("track", "excluded"),
@@ -149,6 +171,7 @@ def freeze(candidates: list[dict], screening: dict, track: dict, metadata: dict,
            classification: dict, loc: dict, contribution: dict,
            providers: dict, seed: int) -> tuple[list[dict], dict]:
     """Build population records for repository-side-eligible repos, then freeze."""
+    config_hash = config_bundle_hash()
     records: list[dict] = []
     seen: set[str] = set()
     for cand in candidates:
@@ -162,8 +185,9 @@ def freeze(candidates: list[dict], screening: dict, track: dict, metadata: dict,
         records.append(build_population_record(
             full, screen, track.get(full), metadata.get(full),
             classification.get(full), loc.get(full), contribution.get(full),
-            providers.get(full)))
+            providers.get(full), config_hash))
     manifest = build_checksum_manifest(records, seed)
+    manifest["configuration_hash"] = config_hash
     return records, manifest
 
 

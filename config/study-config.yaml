@@ -211,9 +211,10 @@ sampling:
 # Anonymous ID scheme
 # -----------------------------------------------------------------------------
 anonymization:
-  treated_id_prefix: "CLR"             # CLR-0001 .. CLR-0500 (Claude repo)
+  treated_id_prefix: "CLR"             # CLR-0001 .. CLR-0500 (Claude deployed track)
+  repository_only_id_prefix: "CLO"     # CLO-0001 ..           (Claude repository-only track)
   control_id_prefix: "CTR"             # CTR-0001 ..           (control repo)
-  id_width: 4
+  id_width: 4                          # prefixes are globally unique across tracks + controls
   # Public URL "hashing" is weak anonymity (reversible by guessing). Deployment
   # URLs are NOT published; if any hash is published it must be a keyed HMAC
   # whose key stays in data/private/. Default: do not publish URL hashes.

@@ -80,21 +80,28 @@ def _mb(nbytes: int) -> float:
 
 
 def build_clone_record(full: str, anon_id: Optional[str], clone_result: dict,
-                       limits: dict) -> dict:
-    """Combine a clone_fn result with the guard decision into a manifest row."""
+                       limits: dict, expected_sha: Optional[str] = None) -> dict:
+    """Combine a clone_fn result with the guard decision + frozen-SHA verification
+    into a manifest row. A checkout whose HEAD != the frozen SHA is REFUSED."""
     if clone_result.get("status") != "OK":
         return {"repository_full_name": full, "anonymous_id": anon_id,
                 "status": "CLONE_ERROR", "exclusion_code": "EX_CLONE_FAILED",
+                "checked_out_sha": clone_result.get("checked_out_sha"),
                 "reasons": clone_result.get("error", "clone failed")}
     size = clone_result.get("size_bytes", 0)
     count = clone_result.get("file_count", 0)
     largest = clone_result.get("largest_file_bytes", 0)
     ok, reasons = check_clone_guards(size, count, largest, limits)
+    checked = clone_result.get("checked_out_sha")
+    # Frozen-version integrity: HEAD after checkout MUST equal the frozen SHA.
+    if expected_sha and checked != expected_sha:
+        ok = False
+        reasons.append(f"sha_mismatch:{str(expected_sha)[:12]}!={str(checked)[:12]}")
     return {
         "repository_full_name": full,
         "anonymous_id": anon_id,
         "status": "OK" if ok else "CLONE_ERROR",
-        "checked_out_sha": clone_result.get("checked_out_sha"),
+        "checked_out_sha": checked,
         "size_mb": _mb(size),
         "file_count": count,
         "largest_file_mb": _mb(largest),
@@ -127,8 +134,10 @@ def write_manifest(records: list[dict], json_path: Path, csv_path: Path) -> None
 CloneFn = Callable[[str, str, Optional[str], Path], dict]
 
 
-def clone_all(selected: list[dict], metadata: dict, clone_root: Path, log_path: Path,
+def clone_all(selected: list[dict], clone_root: Path, log_path: Path,
               clone_fn: CloneFn, limits: dict) -> list[dict]:
+    """Clone each selected repo at its FROZEN sha. Identity (URL + frozen SHA) is
+    read DIRECTLY from the selected sample — never from mutable interim metadata."""
     common.ensure_dir(clone_root)
     records: list[dict] = []
     seen: set[str] = set()
@@ -137,25 +146,34 @@ def clone_all(selected: list[dict], metadata: dict, clone_root: Path, log_path: 
         if not full or full in seen:
             continue
         seen.add(full)
-        meta = metadata.get(full) or {}
-        url = meta.get("repository_url") or f"https://github.com/{full}"
-        ref = meta.get("default_branch_head_sha") or meta.get("default_branch") or "HEAD"
+        url = row.get("repository_url") or f"https://github.com/{full}"
+        frozen_sha = (row.get("frozen_commit_sha") or "").strip()
         dest = clone_root / vca._safe_name(full)
         if not vca._is_within(clone_root, dest):
             records.append({"repository_full_name": full, "status": "CLONE_ERROR",
-                            "exclusion_code": "EX_CLONE_FAILED", "reasons": "path escape"})
+                            "exclusion_code": "EX_CLONE_FAILED", "reasons": "path_escape"})
+            continue
+        if not frozen_sha:
+            # Without a frozen SHA the exact scanned version cannot be pinned.
+            records.append({"repository_full_name": full, "anonymous_id": row.get("anonymous_id"),
+                            "status": "CLONE_ERROR", "exclusion_code": "EX_CLONE_FAILED",
+                            "reasons": "missing_frozen_commit_sha"})
+            _log(log_path, full, "CLONE_ERROR", None)
             continue
         try:
-            result = clone_fn(full, url, ref, dest)
+            result = clone_fn(full, url, frozen_sha, dest)
         except Exception as exc:
             result = {"status": "ERROR", "error": f"{type(exc).__name__}: {exc}"}
-        rec = build_clone_record(full, row.get("anonymous_id"), result, limits)
+        rec = build_clone_record(full, row.get("anonymous_id"), result, limits, frozen_sha)
         records.append(rec)
-        common.append_jsonl(log_path, {"ts": common.iso_now(),
-                                       "repository_full_name": full,
-                                       "status": rec["status"],
-                                       "sha": rec.get("checked_out_sha")})
+        _log(log_path, full, rec["status"], rec.get("checked_out_sha"))
     return records
+
+
+def _log(log_path: Path, full: str, status: str, sha) -> None:
+    common.append_jsonl(log_path, {"ts": common.iso_now(),
+                                   "repository_full_name": full,
+                                   "status": status, "sha": sha})
 
 
 # --------------------------------------------------------------------------- #
@@ -209,11 +227,6 @@ def make_git_clone_fn(git_path: str, clone_root: Path, clone_timeout: int = 300)
 # =========================================================================== #
 # main
 # =========================================================================== #
-def _index(path: Path, key: str = "repository_full_name") -> dict[str, dict]:
-    if not path.exists():
-        return {}
-    return {r[key]: r for r in common.read_json(path)
-            if isinstance(r, dict) and r.get(key)}
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -242,8 +255,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         pilot_size = int(scanner_cfg.get("pilot", {}).get("size", 10))
         selected = sorted(selected, key=lambda r: r.get("anonymous_id", ""))[:pilot_size]
 
-    metadata = _index(STUDY_ROOT / cfg["paths"]["interim"] / "repository-metadata.json")
-
+    # Identity (URL + frozen SHA) comes from the selected sample itself, NOT from
+    # mutable interim metadata (audit P0 #5).
     git = vca.find_git()
     if git is None:
         print("ERROR: git not found on PATH.", file=sys.stderr)
@@ -252,7 +265,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     clone_fn = make_git_clone_fn(git, clone_root, clone_timeout)
     log_path = STUDY_ROOT / cfg["paths"]["logs"] / "clone_selected.jsonl"
 
-    records = clone_all(selected, metadata, clone_root, log_path, clone_fn, limits)
+    records = clone_all(selected, clone_root, log_path, clone_fn, limits)
     write_manifest(records, processed / "clone-manifest.json", processed / "clone-manifest.csv")
 
     ok = sum(1 for r in records if r["status"] == "OK")

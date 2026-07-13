@@ -92,7 +92,7 @@ def stratified_sample(pool: list[dict], target_n: int, seed: int,
             if picked >= quotas.get(key, 0) or owner_count.get(owner, 0) >= max_per_owner:
                 leftovers.append(r)
                 continue
-            selected.append(r)
+            selected.append(dict(r))
             owner_count[owner] = owner_count.get(owner, 0) + 1
             picked += 1
 
@@ -103,9 +103,17 @@ def stratified_sample(pool: list[dict], target_n: int, seed: int,
         owner = _owner(r["repository_full_name"])
         if owner_count.get(owner, 0) >= max_per_owner:
             continue
-        selected.append(r)
+        selected.append(dict(r))
         owner_count[owner] = owner_count.get(owner, 0) + 1
 
+    # Per-stratum inclusion probability (selected / stratum size) on each record.
+    from collections import Counter
+    stratum_size = {k: len(v) for k, v in strata.items()}
+    chosen = Counter(tuple(r.get(s) for s in strata_keys) for r in selected)
+    for r in selected:
+        k = tuple(r.get(s) for s in strata_keys)
+        r["selection_probability"] = (round(chosen[k] / stratum_size[k], 4)
+                                      if stratum_size.get(k) else None)
     return selected
 
 
@@ -197,10 +205,12 @@ def _write_csv(path: Path, records: list[dict], fields: list[str]) -> None:
     os.replace(tmp, path)
 
 
-SELECTED_FIELDS = ["anonymous_id", "repository_full_name", "owner", "track",
-                   "size_bucket", "framework", "application_type", "involvement_band",
-                   "deployment_provider", "deployment_evidence_level",
-                   "relevant_source_loc", "repo_age_months"]
+SELECTED_FIELDS = ["anonymous_id", "repository_full_name", "owner", "repository_url",
+                   "frozen_commit_sha", "metadata_snapshot_hash", "configuration_hash",
+                   "track", "size_bucket", "framework", "application_type",
+                   "involvement_band", "deployment_provider", "deployment_evidence_level",
+                   "relevant_source_loc", "repo_age_months",
+                   "selection_seed", "selection_timestamp", "selection_probability"]
 MATCH_FIELDS = ["treated_id", "treated_repository", "control_repository", "match_quality"]
 
 
@@ -209,7 +219,7 @@ MATCH_FIELDS = ["treated_id", "treated_repository", "control_repository", "match
 # =========================================================================== #
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Select samples + match controls (Phase 18).")
-    args = parser.parse_args(argv)
+    parser.parse_args(argv)
 
     cfg = common.load_study_config()
     seed = int(cfg.get("reproducibility", {}).get("random_seed", 20260711))
@@ -233,12 +243,20 @@ def main(argv: Optional[list[str]] = None) -> int:
     deployed_target = int(tracks.get("deployed", {}).get("target_n", 500))
     repo_only_target = int(tracks.get("repository_only", {}).get("target_n", 500))
 
+    width = int(anon.get("id_width", 4))
+    # Globally-unique prefixes across tracks (audit #12): deployed vs repository-only.
     deployed = assign_anonymous_ids(
         stratified_sample(deployed_pool, deployed_target, seed, max_per_owner),
-        anon.get("treated_id_prefix", "CLR"), int(anon.get("id_width", 4)))
+        anon.get("treated_id_prefix", "CLR"), width)
     repo_only = assign_anonymous_ids(
         stratified_sample(repo_only_pool, repo_only_target, seed + 1, max_per_owner),
-        anon.get("treated_id_prefix", "CLR"), int(anon.get("id_width", 4)))
+        anon.get("repository_only_id_prefix", "CLO"), width)
+
+    # Stamp run-level selection provenance onto each selected record.
+    selection_ts = common.iso_now()
+    for rec in deployed + repo_only:
+        rec["selection_seed"] = seed
+        rec["selection_timestamp"] = selection_ts
 
     # Control pool from the control-cohort frozen population, if present.
     control_pop_path = processed / "control" / "eligible-population.json"
