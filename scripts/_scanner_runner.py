@@ -14,7 +14,6 @@ building + finding-count parsers are unit-tested offline.
 
 from __future__ import annotations
 
-import csv
 import json
 import sys
 import time
@@ -37,8 +36,14 @@ OUTPUT_EXT = {"gitleaks": "json", "semgrep": "sarif", "trivy": "json",
               "osv-scanner": "json", "zizmor": "sarif"}
 
 EXEC_FIELDS = ["repository_full_name", "anonymous_id", "scanner", "commit_sha",
-               "status", "exit_code", "duration_seconds", "finding_count",
-               "output_file", "error_message"]
+               "scanner_version", "ruleset_or_db_hash", "image_digest",
+               "configuration_hash", "status", "exit_code", "start_time", "end_time",
+               "duration_seconds", "timeout_status", "finding_count", "files_analysed",
+               "schema_valid", "reused", "output_file", "error_message"]
+
+# Identity fields that MUST match before an existing raw output may be reused.
+IDENTITY_FIELDS = ["repository_full_name", "commit_sha", "scanner", "scanner_version",
+                   "ruleset_or_db_hash", "image_digest", "configuration_hash"]
 
 
 # =========================================================================== #
@@ -156,33 +161,78 @@ def classify_execution(exit_code: int, timed_out: bool, finding_count: Optional[
 RunFn = Callable[[list], tuple]
 
 
+def build_run_context(scanner: str, ready_marker: Optional[dict]) -> dict:
+    """Identity of the CURRENT pinned toolchain (from the SCANNERS_READY marker)
+    that every raw output is stamped with and validated against."""
+    m = ready_marker or {}
+    versions = m.get("pinned_scanner_versions", {}) or {}
+    if scanner == "semgrep":
+        rd_hash = m.get("semgrep_ruleset_hash")
+    elif scanner == "trivy":
+        rd_hash = (m.get("database_snapshots", {}).get("trivy_db", {}) or {}).get("snapshot_utc")
+    elif scanner == "osv-scanner":
+        rd_hash = (m.get("database_snapshots", {}).get("osv_db", {}) or {}).get("snapshot_utc")
+    else:
+        rd_hash = ""                       # gitleaks/zizmor: no external ruleset/DB
+    return {
+        "scanner_version": versions.get(scanner),
+        "ruleset_or_db_hash": rd_hash,
+        "image_digest": m.get("image_digest") or m.get("image_id"),
+        "configuration_hash": m.get("configuration_hash") or common.config_bundle_hash(),
+    }
+
+
+def _files_analysed(scanner: str, text: str) -> Optional[int]:
+    """Best-effort count of files the scanner reported on (not all expose this)."""
+    obj = _load(text)
+    if scanner in ("semgrep", "zizmor") and isinstance(obj, dict):
+        uris = set()
+        for run in obj.get("runs") or []:
+            for r in (run.get("results") or []):
+                for loc in (r.get("locations") or []):
+                    uri = (loc.get("physicalLocation", {}).get("artifactLocation", {})
+                           .get("uri"))
+                    if uri:
+                        uris.add(uri)
+        return len(uris) or None
+    if scanner == "trivy" and isinstance(obj, dict):
+        return len(obj.get("Results") or []) or None
+    return None
+
+
 def run_one(scanner: str, repo_full: str, anon_id: Optional[str], commit_sha: Optional[str],
             repo_container_path: str, output_host: Path, output_container_path: str,
             mounts: list[tuple], image: str, isolation: dict,
             run_fn: RunFn, docker: str = "docker",
-            accepted_exit_codes: Optional[set] = None) -> dict:
-    """Run one scanner on one repo; the container writes `output_host`. Returns an
-    execution record. A scanner-specific 'findings' exit code is a success (its
-    output is parsed); a genuine failure is never recorded as zero findings."""
+            accepted_exit_codes: Optional[set] = None,
+            run_context: Optional[dict] = None) -> dict:
+    """Run one scanner on one repo; the container writes `output_host`. Returns a
+    COMPLETE execution record (identity + times + status). A 'findings' exit code
+    is a success (output parsed); a genuine failure is never recorded as zero."""
     if accepted_exit_codes is None:
         ok, findings = exit_semantics_for(scanner)
         accepted_exit_codes = ok | findings
+    ctx = run_context or {}
     argv = build_docker_run_args(scanner, repo_container_path, output_container_path,
                                  mounts, image, isolation)
     common.ensure_dir(output_host.parent)
-    start = time.monotonic()
+    start_iso, start = common.iso_now(), time.monotonic()
     timed_out = False
     try:
         rc, _out, err = run_fn([docker, *argv])
     except TimeoutError:
         rc, err, timed_out = 124, "timeout", True
     duration = round(time.monotonic() - start, 2)
+    end_iso = common.iso_now()
 
     finding_count: Optional[int] = None
-    # Parse output for ANY accepted exit code (incl. the findings code), not just 0.
+    files_analysed: Optional[int] = None
+    schema_valid = False
     if rc in accepted_exit_codes and not timed_out and output_host.exists():
-        finding_count = FINDING_PARSERS[scanner](
-            output_host.read_text(encoding="utf-8", errors="replace"))
+        text = output_host.read_text(encoding="utf-8", errors="replace")
+        finding_count = FINDING_PARSERS[scanner](text)
+        schema_valid = finding_count is not None
+        files_analysed = _files_analysed(scanner, text)
 
     status = classify_execution(rc, timed_out, finding_count, accepted_exit_codes)
     return {
@@ -190,13 +240,23 @@ def run_one(scanner: str, repo_full: str, anon_id: Optional[str], commit_sha: Op
         "anonymous_id": anon_id,
         "scanner": scanner,
         "commit_sha": commit_sha,
+        "scanner_version": ctx.get("scanner_version"),
+        "ruleset_or_db_hash": ctx.get("ruleset_or_db_hash"),
+        "image_digest": ctx.get("image_digest"),
+        "configuration_hash": ctx.get("configuration_hash"),
         "status": status,
         "exit_code": rc,
+        "start_time": start_iso,
+        "end_time": end_iso,
         "duration_seconds": duration,
+        "timeout_status": "TIMEOUT" if timed_out else "OK",
         "finding_count": finding_count,
+        "files_analysed": files_analysed,
+        "schema_valid": schema_valid,
+        "reused": False,
         "output_file": str(output_host.relative_to(STUDY_ROOT))
                        if _within(output_host, STUDY_ROOT) else str(output_host),
-        "error_message": (err.strip()[:200] if rc != 0 and err else None),
+        "error_message": (err.strip()[:200] if rc not in accepted_exit_codes and err else None),
     }
 
 
@@ -208,15 +268,57 @@ def _within(path: Path, root: Path) -> bool:
         return False
 
 
+def validate_existing_output(output_host: Path, sidecar: Path, scanner: str,
+                             repo_full: str, commit_sha: Optional[str],
+                             ctx: dict) -> tuple[bool, list]:
+    """True only if the cached raw output is schema-valid AND every identity field
+    (repo, frozen SHA, scanner version, ruleset/DB hash, image digest, config hash)
+    matches the current context. Otherwise the caller must quarantine + re-scan."""
+    reasons: list[str] = []
+    if not output_host.exists():
+        return False, ["no_output"]
+    if not sidecar.exists():
+        return False, ["no_sidecar_record"]
+    try:
+        rec = common.read_json(sidecar)
+    except Exception:
+        return False, ["unreadable_sidecar"]
+    if FINDING_PARSERS[scanner](output_host.read_text(encoding="utf-8", errors="replace")) is None:
+        reasons.append("output_schema_invalid")
+    expected = {"repository_full_name": repo_full, "commit_sha": commit_sha,
+                "scanner": scanner, "scanner_version": ctx.get("scanner_version"),
+                "ruleset_or_db_hash": ctx.get("ruleset_or_db_hash"),
+                "image_digest": ctx.get("image_digest"),
+                "configuration_hash": ctx.get("configuration_hash")}
+    for field in IDENTITY_FIELDS:
+        if rec.get(field) != expected[field]:
+            reasons.append(f"identity_mismatch:{field}")
+    return (not reasons), reasons
+
+
+def _quarantine(output_host: Path, sidecar: Path, results_raw: Path, reasons: list) -> None:
+    import shutil
+    qdir = results_raw / "quarantine" / common.iso_now().replace(":", "").replace("-", "")
+    common.ensure_dir(qdir)
+    for p in (output_host, sidecar):
+        if p.exists():
+            shutil.move(str(p), str(qdir / p.name))
+    common.atomic_write_json(qdir / "reason.json", {"reasons": reasons, "ts": common.iso_now()})
+
+
 def run_all(scanner: str, clone_manifest: list[dict], run_fn: RunFn, *,
-            image: str = SCANNER_IMAGE, docker: str = "docker",
-            pilot: bool = False) -> list[dict]:
-    """Run one scanner over every successfully-cloned repository."""
+            image: Optional[str] = None, docker: str = "docker",
+            ready_marker: Optional[dict] = None, pilot_ids: Optional[set] = None) -> list[dict]:
+    """Run one scanner over every successfully-cloned repository, with immutable
+    append-only records + per-repo sidecars and validated/quarantined reuse."""
     cfg = common.load_study_config()
     scanner_cfg = common.load_yaml(common.CONFIG_DIR / "scanner-config.yaml")
     isolation = _isolation(scanner_cfg)
+    ctx = build_run_context(scanner, ready_marker)
+    image = image or (ctx.get("image_digest") or SCANNER_IMAGE)
     repos_root = STUDY_ROOT / cfg["paths"]["selected_clone"]
     results_raw = STUDY_ROOT / cfg["paths"]["results_raw"] / scanner
+    events_path = results_raw / "execution-records.jsonl"       # append-only, never overwritten
     log_path = STUDY_ROOT / cfg["paths"]["logs"] / f"run_{scanner.replace('-', '_')}.jsonl"
     ext = OUTPUT_EXT[scanner]
     ok_codes, finding_codes = exit_semantics_for(scanner, scanner_cfg)
@@ -227,47 +329,57 @@ def run_all(scanner: str, clone_manifest: list[dict], run_fn: RunFn, *,
         if entry.get("status") != "OK":
             continue
         full = entry["repository_full_name"]
+        if pilot_ids is not None and entry.get("anonymous_id") not in pilot_ids:
+            continue
         safe = vca._safe_name(full)
         repo_host = repos_root / safe
         if not repo_host.exists():
             continue
         output_host = results_raw / f"{safe}.{ext}"
-        if common.is_valid_json_file(output_host) or output_host.exists():
-            continue  # immutable: never re-scan/overwrite an existing raw output
+        sidecar = results_raw / f"{safe}.record.json"
+        commit_sha = entry.get("checked_out_sha")
+
+        if output_host.exists() or sidecar.exists():
+            valid, reasons = validate_existing_output(output_host, sidecar, scanner,
+                                                      full, commit_sha, ctx)
+            if valid:
+                rec = common.read_json(sidecar)
+                rec["reused"] = True
+                records.append(rec)
+                _append_event(events_path, log_path, rec)
+                continue
+            # Invalid/stale -> quarantine and re-scan (do NOT skip on path existence).
+            _quarantine(output_host, sidecar, results_raw, reasons)
+
         mounts = [
             (str(repos_root), "/scan/repositories", "ro"),
             (str(STUDY_ROOT / cfg["paths"]["results_raw"]), "/scan/results/raw", "rw"),
             (str(common.CONFIG_DIR), "/scan/config", "ro"),
             (str(STUDY_ROOT / "config" / "semgrep-rules-cache"), "/scan/semgrep-rules", "ro"),
+            (str(STUDY_ROOT / "config" / "trivy-cache"), "/scan/trivy-cache", "ro"),
+            (str(STUDY_ROOT / "config" / "osv-db"), "/scan/osv-db", "ro"),
         ]
         rec = run_one(
-            scanner, full, entry.get("anonymous_id"), entry.get("checked_out_sha"),
+            scanner, full, entry.get("anonymous_id"), commit_sha,
             f"/scan/repositories/{safe}", output_host,
             f"/scan/results/raw/{scanner}/{safe}.{ext}", mounts, image, isolation,
-            run_fn, docker, accepted_exit_codes=accepted)
+            run_fn, docker, accepted_exit_codes=accepted, run_context=ctx)
+        common.atomic_write_json(sidecar, rec)          # one record per repo x scanner
         records.append(rec)
-        common.append_jsonl(log_path, {"ts": common.iso_now(), **{
-            k: rec[k] for k in ("repository_full_name", "status", "finding_count", "exit_code")}})
-    _write_execution_records(records, results_raw / "execution-records")
+        _append_event(events_path, log_path, rec)
     return records
+
+
+def _append_event(events_path: Path, log_path: Path, rec: dict) -> None:
+    common.append_jsonl(events_path, {"event_ts": common.iso_now(), **rec})
+    common.append_jsonl(log_path, {"ts": common.iso_now(), **{
+        k: rec.get(k) for k in ("repository_full_name", "status", "finding_count",
+                                "exit_code", "reused")}})
 
 
 def _isolation(scanner_cfg: dict) -> dict:
     iso = scanner_cfg.get("isolation", {})
     return {"user_uid": "10001:10001", "limits": iso.get("limits", {})}
-
-
-def _write_execution_records(records: list[dict], base: Path) -> None:
-    import os
-    common.atomic_write_json(base.with_suffix(".json"), records)
-    common.ensure_dir(base.parent)
-    tmp = base.with_suffix(".csv.tmp")
-    with tmp.open("w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=EXEC_FIELDS, extrasaction="ignore")
-        writer.writeheader()
-        for rec in records:
-            writer.writerow(rec)
-    os.replace(tmp, base.with_suffix(".csv"))
 
 
 # =========================================================================== #
@@ -293,6 +405,20 @@ def cli_main(scanner: str, argv: Optional[list[str]] = None) -> int:
               file=sys.stderr)
         return 2
 
+    # SCANNERS_READY gate: refuse (pilot AND scan) unless the pinned toolchain is
+    # prepared and neither the config nor the image has drifted since prepare.
+    try:
+        from . import prepare_scanners as ps  # type: ignore
+    except Exception:  # pragma: no cover
+        import prepare_scanners as ps  # type: ignore
+    marker = ps.load_ready_marker()
+    state, reasons = ps.scanners_ready_state(
+        marker, common.config_bundle_hash(), (marker or {}).get("image_digest"))
+    if state != "READY":
+        print(f"REFUSING TO SCAN: SCANNERS_READY is {state} ({reasons}).", file=sys.stderr)
+        print("Run 'make prepare-scanners' first.", file=sys.stderr)
+        return 2
+
     docker = shutil.which("docker")
     if docker is None:
         print("ERROR: docker not found on PATH.", file=sys.stderr)
@@ -306,7 +432,16 @@ def cli_main(scanner: str, argv: Optional[list[str]] = None) -> int:
         return proc.returncode, proc.stdout or "", proc.stderr or ""
 
     clone_manifest = common.read_json(manifest_path)
-    records = run_all(scanner, clone_manifest, run_fn, docker=docker, pilot=args.pilot)
+    pilot_ids = None
+    if args.pilot:
+        size = int(common.load_yaml(common.CONFIG_DIR / "scanner-config.yaml")
+                   .get("pilot", {}).get("size", 10))
+        ok_ids = sorted(r.get("anonymous_id") for r in clone_manifest
+                        if r.get("status") == "OK" and r.get("anonymous_id"))
+        pilot_ids = set(ok_ids[:size])
+
+    records = run_all(scanner, clone_manifest, run_fn, docker=docker,
+                      ready_marker=marker, pilot_ids=pilot_ids)
 
     from collections import Counter
     statuses = Counter(r["status"] for r in records)

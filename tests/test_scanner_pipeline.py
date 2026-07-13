@@ -9,6 +9,7 @@ import pytest
 import prepare_scanners as ps
 import clone_selected_repositories as cl
 import _scanner_runner as sr
+import _common as common
 
 
 # =========================================================================== #
@@ -272,3 +273,94 @@ def test_run_one_scanner_error_is_not_zero_findings(tmp_path):
                      [], "img", {"limits": {}}, run_fn)
     assert rec["status"] == "SCANNER_ERROR"
     assert rec["finding_count"] is None       # NOT zeroed on failure
+
+
+# --- P0 #4: run context, complete records, validation, quarantine ----------- #
+def test_build_run_context_from_marker():
+    marker = {"pinned_scanner_versions": {"semgrep": "1.97.0", "gitleaks": "8.21.2"},
+              "semgrep_ruleset_hash": "RH", "image_digest": "IMG", "configuration_hash": "CFG",
+              "database_snapshots": {"trivy_db": {"snapshot_utc": "T"}, "osv_db": {"snapshot_utc": "O"}}}
+    ctx = sr.build_run_context("semgrep", marker)
+    assert ctx["scanner_version"] == "1.97.0" and ctx["ruleset_or_db_hash"] == "RH"
+    assert ctx["image_digest"] == "IMG" and ctx["configuration_hash"] == "CFG"
+    assert sr.build_run_context("gitleaks", marker)["ruleset_or_db_hash"] == ""
+    assert sr.build_run_context("trivy", marker)["ruleset_or_db_hash"] == "T"
+
+
+def test_run_one_records_complete_fields():
+    ctx = {"scanner_version": "8.21.2", "ruleset_or_db_hash": "", "image_digest": "IMG",
+           "configuration_hash": "CFG"}
+
+    def run_fn(cmd):
+        return 0, "", ""
+
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        out = Path(d) / "o__r.json"
+        out.write_text("[]", encoding="utf-8")
+        rec = sr.run_one("gitleaks", "o/r", "CLR-0001", "sha1", "/scan/repositories/o__r",
+                         out, "/scan/results/raw/gitleaks/o__r.json", [], "IMG",
+                         {"limits": {}}, run_fn, run_context=ctx)
+    for f in ("start_time", "end_time", "timeout_status", "scanner_version",
+              "image_digest", "configuration_hash", "schema_valid", "files_analysed"):
+        assert f in rec
+    assert rec["scanner_version"] == "8.21.2" and rec["image_digest"] == "IMG"
+    assert rec["schema_valid"] is True and rec["timeout_status"] == "OK"
+
+
+def test_validate_existing_output(tmp_path):
+    out = tmp_path / "o__r.json"
+    out.write_text("[]", encoding="utf-8")            # valid (empty) gitleaks output
+    side = tmp_path / "o__r.record.json"
+    ctx = {"scanner_version": "8.21.2", "ruleset_or_db_hash": "", "image_digest": "IMG",
+           "configuration_hash": "CFG"}
+    rec = {"repository_full_name": "o/r", "commit_sha": "sha1", "scanner": "gitleaks",
+           "scanner_version": "8.21.2", "ruleset_or_db_hash": "", "image_digest": "IMG",
+           "configuration_hash": "CFG"}
+    side.write_text(json.dumps(rec), encoding="utf-8")
+
+    assert sr.validate_existing_output(out, side, "gitleaks", "o/r", "sha1", ctx)[0] is True
+    # frozen-SHA mismatch -> invalid
+    ok, reasons = sr.validate_existing_output(out, side, "gitleaks", "o/r", "OTHER", ctx)
+    assert ok is False and any("commit_sha" in r for r in reasons)
+    # corrupt output -> schema invalid
+    out.write_text("not json", encoding="utf-8")
+    ok, reasons = sr.validate_existing_output(out, side, "gitleaks", "o/r", "sha1", ctx)
+    assert ok is False and "output_schema_invalid" in reasons
+
+
+def test_run_all_records_accumulate_resume_and_quarantine(tmp_path, monkeypatch):
+    monkeypatch.setattr(sr, "STUDY_ROOT", tmp_path)
+    (tmp_path / "repositories" / "selected" / "o__r").mkdir(parents=True)
+    raw_dir = tmp_path / "results" / "raw" / "gitleaks"
+    out_host = raw_dir / "o__r.json"
+    marker = {"pinned_scanner_versions": {"gitleaks": "8.21.2"}, "image_digest": "IMG",
+              "configuration_hash": common.config_bundle_hash()}
+    manifest = [{"repository_full_name": "o/r", "status": "OK",
+                 "anonymous_id": "CLR-0001", "checked_out_sha": "sha1"}]
+    calls = {"n": 0}
+
+    def run_fn(cmd):
+        calls["n"] += 1
+        out_host.parent.mkdir(parents=True, exist_ok=True)
+        out_host.write_text('[{"RuleID":"x","Secret":"REDACTED"}]', encoding="utf-8")
+        return 0, "", ""
+
+    recs = sr.run_all("gitleaks", manifest, run_fn, ready_marker=marker)
+    assert calls["n"] == 1 and recs[0]["finding_count"] == 1
+    events = raw_dir / "execution-records.jsonl"
+    assert (raw_dir / "o__r.record.json").exists() and events.exists()
+
+    # Resume: a valid sidecar is reused; the scanner is NOT re-run.
+    def boom(cmd):
+        raise AssertionError("must not re-scan a valid cached output")
+    recs2 = sr.run_all("gitleaks", manifest, boom, ready_marker=marker)
+    assert recs2[0]["reused"] is True
+    assert len(events.read_text(encoding="utf-8").strip().splitlines()) >= 2  # append-only
+
+    # Stale identity (config drift) -> quarantine + re-scan (not skipped).
+    stale = dict(marker); stale["configuration_hash"] = "OTHER_CFG_HASH"
+    calls["n"] = 0
+    sr.run_all("gitleaks", manifest, run_fn, ready_marker=stale)
+    assert calls["n"] == 1
+    assert list((raw_dir / "quarantine").glob("*"))
