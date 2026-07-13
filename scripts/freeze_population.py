@@ -239,6 +239,24 @@ def main(argv: Optional[list[str]] = None) -> int:
     records, manifest = freeze(candidates, screening, track, metadata, classification,
                                loc, contribution, providers, seed)
 
+    # Manual-review gate (audit #10): refuse to freeze while any eligible repo is
+    # still PENDING; drop human-EXCLUDEd repos.
+    try:
+        from . import resolve_manual_review as mrv  # type: ignore
+    except Exception:  # pragma: no cover
+        import resolve_manual_review as mrv  # type: ignore
+    decisions = mrv.read_decisions(bp / "manual-review-decisions.csv")
+    records, pending = mrv.apply_decisions(records, decisions)
+    if pending:
+        print("REFUSING TO FREEZE: unresolved manual-review (PENDING) cases:", file=sys.stderr)
+        for full in pending[:50]:
+            print(f"  {full}", file=sys.stderr)
+        print("Resolve each to INCLUDE/EXCLUDE in manual-review-decisions.csv "
+              "(run 'make resolve-review'), then re-freeze.", file=sys.stderr)
+        return 2
+    manifest = build_checksum_manifest(records, seed)
+    manifest["configuration_hash"] = config_bundle_hash()
+
     write_population(records, bp / "eligible-population.json", bp / "eligible-population.csv")
     write_checksum(manifest, bp / "eligible-population-checksum.txt")
 

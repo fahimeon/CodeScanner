@@ -181,6 +181,11 @@ screen:
 	$(call require_script,$(SCRIPTS)/screen_candidates.py)
 	$(PYTHON) $(SCRIPTS)/screen_candidates.py
 
+.PHONY: resolve-review
+resolve-review:
+	$(call require_script,$(SCRIPTS)/resolve_manual_review.py)
+	$(PYTHON) $(SCRIPTS)/resolve_manual_review.py
+
 .PHONY: freeze
 freeze:
 	$(call require_script,$(SCRIPTS)/freeze_population.py)
