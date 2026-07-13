@@ -444,6 +444,23 @@ def cli_main(scanner: str, argv: Optional[list[str]] = None) -> int:
         ok_ids = sorted(r.get("anonymous_id") for r in clone_manifest
                         if r.get("status") == "OK" and r.get("anonymous_id"))
         pilot_ids = set(ok_ids[:size])
+    else:
+        # FULL scan: refuse unless a PASS pilot gate matches the current
+        # sample / config / image / ruleset hashes (audit P0 #7).
+        try:
+            from . import pilot_gate as pg  # type: ignore
+        except Exception:  # pragma: no cover
+            import pilot_gate as pg  # type: ignore
+        all_ok = [r for r in clone_manifest if r.get("status") == "OK" and r.get("anonymous_id")]
+        gstate, greasons = pg.pilot_gate_state(
+            pg.load_gate(), sample_sha=pg.sample_hash(all_ok),
+            config_hash=common.config_bundle_hash(),
+            image_digest=(marker or {}).get("image_digest"),
+            ruleset_hash=(marker or {}).get("semgrep_ruleset_hash"))
+        if gstate != "PASS":
+            print(f"REFUSING FULL SCAN: pilot gate is {gstate} ({greasons}).", file=sys.stderr)
+            print("Run 'make pilot' then 'make pilot-gate' first.", file=sys.stderr)
+            return 2
 
     # Gitleaks history scans the bare MIRROR clones, not the working tree.
     repos_root = None

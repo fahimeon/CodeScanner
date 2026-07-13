@@ -207,10 +207,18 @@ pilot: guard-frozen
 	$(call require_script,$(SCRIPTS)/run_zizmor.py)
 	$(PYTHON) $(SCRIPTS)/clone_selected_repositories.py --pilot
 	$(PYTHON) $(SCRIPTS)/run_gitleaks.py --pilot
+	$(PYTHON) $(SCRIPTS)/run_gitleaks.py --history --pilot
 	$(PYTHON) $(SCRIPTS)/run_semgrep.py --pilot
 	$(PYTHON) $(SCRIPTS)/run_trivy.py --pilot
 	$(PYTHON) $(SCRIPTS)/run_osv_scanner.py --pilot
 	$(PYTHON) $(SCRIPTS)/run_zizmor.py --pilot
+	$(MAKE) pilot-gate
+
+# Evaluate the machine-readable pilot gate (must PASS before `make scan`).
+.PHONY: pilot-gate
+pilot-gate:
+	$(call require_script,$(SCRIPTS)/pilot_gate.py)
+	$(PYTHON) $(SCRIPTS)/pilot_gate.py
 
 # HARD GUARD: no scanning without the frozen 500 sample.
 .PHONY: scan
