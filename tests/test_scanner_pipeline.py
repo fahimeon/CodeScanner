@@ -14,37 +14,70 @@ import _scanner_runner as sr
 # =========================================================================== #
 # prepare_scanners
 # =========================================================================== #
-def test_build_image_and_inspect_args():
+def test_build_scanner_commands():
     assert ps.build_image_args("docker/Dockerfile.scanner", "img")[:2] == ["build", "-f"]
     assert "img" in ps.inspect_digest_args("img")
-    assert ps.parse_digest("  sha256:abc  ") == "sha256:abc"
-    assert ps.parse_digest("") is None
+    assert ps.parse_digest("  sha256:abc  ") == "sha256:abc" and ps.parse_digest("") is None
+    assert ps.build_trivy_download_args("/c")[:2] == ["fs", "--download-db-only"]
+    assert "/c" in ps.build_trivy_download_args("/c")
+    assert "/d" in ps.build_osv_download_args("/d")
+    smoke = ps.build_smoke_args("gitleaks", "img")
+    assert "--network" in smoke and "none" in smoke and "--entrypoint" in smoke
 
 
-def test_prepare_sequence_records_steps_and_digest(tmp_path):
-    calls = []
+def _point_caches(monkeypatch, tmp_path, populate=True):
+    for attr, name in [("SEMGREP_CACHE", "sg"), ("TRIVY_CACHE", "tv"), ("OSV_DB_DIR", "osv")]:
+        d = tmp_path / name
+        d.mkdir(exist_ok=True)
+        if populate:
+            (d / "pinned").write_text("data", encoding="utf-8")
+        monkeypatch.setattr(ps, attr, d)
+
+
+def test_prepare_ready_when_all_present(tmp_path, monkeypatch):
+    _point_caches(monkeypatch, tmp_path, populate=True)
 
     def run_fn(cmd):
-        calls.append(cmd)
-        if "inspect" in cmd and "{{index .RepoDigests 0}}" in cmd:
-            return 0, "myimage@sha256:deadbeef\n", ""
+        joined = " ".join(str(c) for c in cmd)
+        if "RepoDigests" in joined:
+            return 0, "img@sha256:deadbeef\n", ""
         if "inspect" in cmd:
             return 0, "sha256:localid\n", ""
+        return 0, "v1.0.0\n", ""            # build/export/download/smoke all succeed
+
+    marker = ps.prepare("docker", "semgrep", "trivy", "osv-scanner", run_fn, build=True)
+    assert marker["ready"] is True
+    assert marker["image_digest"] == "img@sha256:deadbeef"
+    assert marker["semgrep_ruleset_hash"] and len(marker["semgrep_ruleset_hash"]) == 64
+    assert all(marker["smoke_tests"][s]["ok"] for s in ps.FIVE_SCANNERS)
+    assert marker["configuration_hash"]
+
+
+def test_prepare_fail_closed_when_rules_or_dbs_missing(tmp_path, monkeypatch):
+    _point_caches(monkeypatch, tmp_path, populate=False)   # empty caches
+
+    def run_fn(cmd):
+        joined = " ".join(str(c) for c in cmd)
+        if "RepoDigests" in joined:
+            return 0, "img@sha256:dead\n", ""
+        if "inspect" in cmd:
+            return 0, "sha256:id\n", ""
         return 0, "", ""
 
-    manifest = ps.prepare("docker", "trivy", run_fn, build=True, cache_root=tmp_path)
-    assert manifest["image_prepared"] is True
-    assert manifest["image_digest"] == "myimage@sha256:deadbeef"
-    names = [s["name"] for s in manifest["steps"]]
-    assert "build_scanner_image" in names and "prefetch_trivy_db" in names
-    assert manifest["pinned_scanner_versions"].get("gitleaks")   # from Dockerfile
+    marker = ps.prepare("docker", None, None, None, run_fn, build=True)
+    assert marker["ready"] is False           # fail-closed
+    assert "semgrep_rules_cache_missing" in marker["problems"]
+    assert "trivy_db_missing" in marker["problems"]
+    assert "osv_db_missing" in marker["problems"]
 
 
-def test_prepare_reports_unprepared_when_no_digest(tmp_path):
-    def run_fn(cmd):
-        return 1, "", "boom"        # everything fails
-    manifest = ps.prepare("docker", None, run_fn, build=True, cache_root=tmp_path)
-    assert manifest["image_prepared"] is False
+def test_scanners_ready_state_transitions():
+    m = {"ready": True, "configuration_hash": "CFG", "image_digest": "IMG"}
+    assert ps.scanners_ready_state(m, "CFG", "IMG")[0] == "READY"
+    assert ps.scanners_ready_state(m, "OTHER", "IMG")[0] == "STALE"     # config drift
+    assert ps.scanners_ready_state(m, "CFG", "OTHERIMG")[0] == "STALE"  # image drift
+    assert ps.scanners_ready_state(None, "CFG")[0] == "NOT_READY"
+    assert ps.scanners_ready_state({"ready": False, "problems": ["x"]}, "CFG")[0] == "NOT_READY"
 
 
 # =========================================================================== #

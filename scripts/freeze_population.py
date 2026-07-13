@@ -68,11 +68,7 @@ def metadata_snapshot_hash(meta: dict) -> str:
 
 def config_bundle_hash() -> str:
     """Hash of ALL config files, so a frozen record is tied to the exact config."""
-    parts = []
-    for path in sorted(common.CONFIG_DIR.iterdir()):
-        if path.is_file():
-            parts.append(f"{path.name}:{common.sha256_hex(path.read_bytes())}")
-    return common.sha256_hex("\n".join(parts))
+    return common.config_bundle_hash()
 
 
 def build_population_record(full: str, screen: dict, track: dict, meta: dict,

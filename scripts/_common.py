@@ -14,7 +14,7 @@ import json
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import yaml
 
@@ -86,3 +86,26 @@ def load_yaml(path: Path) -> dict:
 
 def load_study_config() -> dict:
     return load_yaml(CONFIG_DIR / "study-config.yaml")
+
+
+def config_bundle_hash() -> str:
+    """Order-independent SHA-256 over ALL config files, so any frozen artifact,
+    SCANNERS_READY marker, or pilot record is tied to the exact configuration."""
+    parts = []
+    for path in sorted(CONFIG_DIR.iterdir()):
+        if path.is_file():
+            parts.append(f"{path.name}:{sha256_hex(path.read_bytes())}")
+    return sha256_hex("\n".join(parts))
+
+
+def hash_dir(path: Path) -> Optional[str]:
+    """Deterministic SHA-256 over a directory's file contents (relpath + hash),
+    order-independent. Returns None if the directory is missing or empty."""
+    path = Path(path)
+    if not path.is_dir():
+        return None
+    parts = []
+    for f in sorted(path.rglob("*")):
+        if f.is_file():
+            parts.append(f"{f.relative_to(path).as_posix()}:{sha256_hex(f.read_bytes())}")
+    return sha256_hex("\n".join(parts)) if parts else None
