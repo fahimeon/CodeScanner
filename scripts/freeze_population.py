@@ -239,6 +239,29 @@ def main(argv: Optional[list[str]] = None) -> int:
     records, manifest = freeze(candidates, screening, track, metadata, classification,
                                loc, contribution, providers, seed)
 
+    # Two-check deployment policy (audit #8): a DEPLOYED-track repo must pass BOTH
+    # the screening (first) and pre-freeze (second) checks. The second check is
+    # independent (its own cache). A deployed repo lacking a passing two-check is
+    # downgraded to repository_only (deployment gate not satisfied twice).
+    try:
+        from . import verify_deployments as vdep  # type: ignore
+    except Exception:  # pragma: no cover
+        import verify_deployments as vdep  # type: ignore
+    first = _index(bpriv / "deployment-verification-first.json")
+    second = _index(bpriv / "deployment-verification-second.json")
+    downgraded = 0
+    for r in records:
+        if r.get("track") == "deployed":
+            full = r["repository_full_name"]
+            if not vdep.two_check_passed(first.get(full), second.get(full)):
+                r["track"] = "repository_only"
+                r["deployed_eligible"] = False
+                r["two_check_downgraded"] = True
+                downgraded += 1
+    if downgraded:
+        print(f"  two-check policy: {downgraded} deployed repo(s) downgraded to "
+              f"repository_only (did not pass both deployment checks).")
+
     # Manual-review gate (audit #10): refuse to freeze while any eligible repo is
     # still PENDING; drop human-EXCLUDEd repos.
     try:

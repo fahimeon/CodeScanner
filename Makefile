@@ -167,8 +167,15 @@ discover-deployments:
 verify-deployments:
 	$(call require_script,$(SCRIPTS)/verify_deployments.py)
 	$(call require_script,$(SCRIPTS)/verify_repository_deployment_match.py)
-	$(PYTHON) $(SCRIPTS)/verify_deployments.py
+	$(PYTHON) $(SCRIPTS)/verify_deployments.py --stage first
 	$(PYTHON) $(SCRIPTS)/verify_repository_deployment_match.py
+
+# Independent SECOND (pre-freeze) deployment check; required by the two-check
+# policy before `make freeze`. Run separated in time from the first check.
+.PHONY: verify-deployments-second
+verify-deployments-second:
+	$(call require_script,$(SCRIPTS)/verify_deployments.py)
+	$(PYTHON) $(SCRIPTS)/verify_deployments.py --stage second
 
 # --- Phase 16-18: screening, freeze, selection ----------------------------- #
 .PHONY: detect-duplicates

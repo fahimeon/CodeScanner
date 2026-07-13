@@ -80,6 +80,17 @@ def test_verify_one_captures_signals():
     assert rec["checked_url"] == "https://app.example.com"
 
 
+def test_two_check_passed_policy():
+    ok = {"availability_eligible": True}
+    bad = {"availability_eligible": False, "deployment_status": "DEAD_404"}
+    temp = {"availability_eligible": False, "deployment_status": "TIMEOUT"}
+    assert vd.two_check_passed(ok, ok) is True                 # both eligible
+    assert vd.two_check_passed(ok, bad) is False               # second fails
+    assert vd.two_check_passed(bad, ok) is False               # first fail (not temporary)
+    assert vd.two_check_passed(temp, ok) is True               # first temporary, second ok
+    assert vd.two_check_passed(None, ok) is False              # missing a check
+
+
 def test_verify_all_gates_and_caches(tmp_path):
     calls = {"n": 0}
 

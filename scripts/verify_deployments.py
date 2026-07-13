@@ -303,9 +303,25 @@ def make_http_fn(cfg: dict) -> HttpFn:
 # =========================================================================== #
 # main
 # =========================================================================== #
+def two_check_passed(first: Optional[dict], second: Optional[dict],
+                     temporary_states=("TIMEOUT", "SERVER_ERROR")) -> bool:
+    """Two-check policy (deployment-rules two_check_policy): qualifies if BOTH the
+    screening and pre-freeze checks are availability-eligible, OR the final check
+    is eligible and the earlier failure looks temporary."""
+    if not first or not second:
+        return False
+    if first.get("availability_eligible") and second.get("availability_eligible"):
+        return True
+    if second.get("availability_eligible") and first.get("deployment_status") in temporary_states:
+        return True
+    return False
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Non-invasive deployment availability (Phase 11-13).")
     parser.add_argument("--control", action="store_true")
+    parser.add_argument("--stage", choices=["first", "second"], default="first",
+                        help="first = eligibility-screening check; second = pre-freeze check")
     args = parser.parse_args(argv)
 
     cfg = common.load_study_config()
@@ -322,16 +338,26 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 2
     discovery_records = common.read_json(discovery_path)
 
-    raw_dir = base_private / "deployment-verification"
+    # STAGE-SPECIFIC storage + cache: the second (pre-freeze) check NEVER reuses the
+    # first (screening) check's cache — they are independent (audit #8).
+    stage = args.stage
+    raw_dir = base_private / f"deployment-verification-{stage}"
     log_path = STUDY_ROOT / cfg["paths"]["logs"] / (
-        "verify_deployments_control.jsonl" if args.control else "verify_deployments.jsonl")
+        f"verify_deployments_{stage}{'_control' if args.control else ''}.jsonl")
     http_fn = make_http_fn(deploy_cfg)
 
     rows = verify_all(discovery_records, raw_dir, log_path, http_fn, deploy_cfg)
     write_verification(rows,
-                       base_private / "deployment-verification.json",
-                       base_private / "deployment-verification.csv",
-                       base_interim / "deployment-verification-summary.csv")
+                       base_private / f"deployment-verification-{stage}.json",
+                       base_private / f"deployment-verification-{stage}.csv",
+                       base_interim / f"deployment-verification-{stage}-summary.csv")
+    # The match phase consumes the FIRST check; keep the canonical name pointing at it.
+    if stage == "first":
+        write_verification(rows,
+                           base_private / "deployment-verification.json",
+                           base_private / "deployment-verification.csv",
+                           base_interim / "deployment-verification-summary.csv")
+    print(f"[{stage} check] checked {len(rows)} deployments (non-invasive HEAD/GET on '/').")
 
     from collections import Counter
     statuses = Counter(r.get("deployment_status") for r in rows if r.get("status") == "OK")
