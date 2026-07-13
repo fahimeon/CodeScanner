@@ -3,9 +3,11 @@
 import select_sample as ss
 
 
-def _repo(name, size="small", fw="next", owner=None, age=12.0):
+def _repo(name, size="small", fw="next", owner=None, age=12.0,
+          app="fullstack_monolith", provider="vercel", deployed=True):
     return {"repository_full_name": name, "size_bucket": size, "framework": fw,
-            "repo_age_months": age}
+            "repo_age_months": age, "application_type": app, "deployment_provider": provider,
+            "deployed_eligible": deployed, "relevant_source_loc": 3000}
 
 
 # --------------------------------------------------------------------------- #
@@ -53,24 +55,55 @@ def test_assign_anonymous_ids():
 # --------------------------------------------------------------------------- #
 # Control matching
 # --------------------------------------------------------------------------- #
-def test_match_controls_exact_then_relaxed():
-    treated = [_repo("t/a", size="small", fw="next"),
-               _repo("t/b", size="large", fw="vite")]
-    controls = [_repo("c/x", size="small", fw="next"),      # exact for t/a
-                _repo("c/y", size="large", fw="astro", age=13)]  # size_only for t/b
-    matches = ss.match_controls(treated, controls, seed=3)
-    by = {m["treated_repository"]: m for m in matches}
-    assert by["t/a"]["control_repository"] == "c/x" and by["t/a"]["match_quality"] == "exact"
-    assert by["t/b"]["control_repository"] == "c/y" and by["t/b"]["match_quality"] == "size_only"
+def test_match_within_caliper_on_exact_covariates():
+    treated = [_repo("t/a", age=12.0)]
+    controls = [_repo("c/x", age=15.0),                      # within 6-month caliper
+                _repo("c/far", age=40.0)]                    # outside caliper
+    matches = ss.match_controls(treated, controls, seed=3, age_caliper_months=6.0)
+    m = matches[0]
+    assert m["control_repository"] == "c/x"
+    assert m["match_quality"] == "exact_strata_within_caliper"
+    assert m["distance_age_months"] == 3.0
 
 
-def test_match_controls_one_to_one_no_reuse():
-    treated = [_repo("t/a", size="small", fw="next"), _repo("t/b", size="small", fw="next")]
-    controls = [_repo("c/x", size="small", fw="next")]       # only one control
+def test_match_requires_control_deployment_for_deployed_cohort():
+    treated = [_repo("t/a")]
+    controls = [_repo("c/x", deployed=False)]                # control has no deployment
+    matches = ss.match_controls(treated, controls, seed=1, require_control_deployment=True)
+    assert matches[0]["control_repository"] is None
+    assert matches[0]["unmatched_reason"] == "no_control_in_strata"
+
+
+def test_match_respects_age_caliper():
+    treated = [_repo("t/a", age=12.0)]
+    controls = [_repo("c/x", age=30.0)]                      # 18 months > 6 caliper
+    matches = ss.match_controls(treated, controls, seed=1, age_caliper_months=6.0)
+    assert matches[0]["control_repository"] is None
+    assert matches[0]["unmatched_reason"] == "no_control_within_age_caliper"
+
+
+def test_match_no_reuse_and_no_silent_relaxation():
+    treated = [_repo("t/a"), _repo("t/b")]
+    controls = [_repo("c/x")]                                # only one qualifying control
     matches = ss.match_controls(treated, controls, seed=1)
     used = [m["control_repository"] for m in matches if m["control_repository"]]
     assert used == ["c/x"]                                   # not reused
-    assert any(m["match_quality"] == "unmatched" for m in matches)
+    # A differing covariate is NOT silently relaxed.
+    treated2 = [_repo("t/c", fw="next")]
+    controls2 = [_repo("c/z", fw="astro")]                   # framework differs
+    assert ss.match_controls(treated2, controls2, seed=1)[0]["control_repository"] is None
+
+
+def test_compute_smd_and_balance_report():
+    assert ss.compute_smd([10, 10, 10], [10, 10, 10]) == 0.0
+    smd = ss.compute_smd([10, 12, 14], [4, 6, 8])
+    assert smd is not None and smd > 0
+    treated = [_repo("t/a", age=12.0), _repo("t/b", age=14.0)]
+    controls = [_repo("c/x", age=13.0), _repo("c/y", age=50.0)]
+    matches = ss.match_controls(treated, controls, seed=1, age_caliper_months=6.0)
+    bal = ss.balance_report(treated, controls, matches, ("repo_age_months",))
+    assert "repo_age_months" in bal
+    assert "smd_pre_match" in bal["repo_age_months"] and "smd_post_match" in bal["repo_age_months"]
 
 
 def test_selection_report_counts_shortfall_and_match_rate():

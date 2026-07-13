@@ -167,8 +167,15 @@ discover-deployments:
 verify-deployments:
 	$(call require_script,$(SCRIPTS)/verify_deployments.py)
 	$(call require_script,$(SCRIPTS)/verify_repository_deployment_match.py)
-	$(PYTHON) $(SCRIPTS)/verify_deployments.py
+	$(PYTHON) $(SCRIPTS)/verify_deployments.py --stage first
 	$(PYTHON) $(SCRIPTS)/verify_repository_deployment_match.py
+
+# Independent SECOND (pre-freeze) deployment check; required by the two-check
+# policy before `make freeze`. Run separated in time from the first check.
+.PHONY: verify-deployments-second
+verify-deployments-second:
+	$(call require_script,$(SCRIPTS)/verify_deployments.py)
+	$(PYTHON) $(SCRIPTS)/verify_deployments.py --stage second
 
 # --- Phase 16-18: screening, freeze, selection ----------------------------- #
 .PHONY: detect-duplicates
@@ -180,6 +187,11 @@ detect-duplicates:
 screen:
 	$(call require_script,$(SCRIPTS)/screen_candidates.py)
 	$(PYTHON) $(SCRIPTS)/screen_candidates.py
+
+.PHONY: resolve-review
+resolve-review:
+	$(call require_script,$(SCRIPTS)/resolve_manual_review.py)
+	$(PYTHON) $(SCRIPTS)/resolve_manual_review.py
 
 .PHONY: freeze
 freeze:
@@ -207,10 +219,18 @@ pilot: guard-frozen
 	$(call require_script,$(SCRIPTS)/run_zizmor.py)
 	$(PYTHON) $(SCRIPTS)/clone_selected_repositories.py --pilot
 	$(PYTHON) $(SCRIPTS)/run_gitleaks.py --pilot
+	$(PYTHON) $(SCRIPTS)/run_gitleaks.py --history --pilot
 	$(PYTHON) $(SCRIPTS)/run_semgrep.py --pilot
 	$(PYTHON) $(SCRIPTS)/run_trivy.py --pilot
 	$(PYTHON) $(SCRIPTS)/run_osv_scanner.py --pilot
 	$(PYTHON) $(SCRIPTS)/run_zizmor.py --pilot
+	$(MAKE) pilot-gate
+
+# Evaluate the machine-readable pilot gate (must PASS before `make scan`).
+.PHONY: pilot-gate
+pilot-gate:
+	$(call require_script,$(SCRIPTS)/pilot_gate.py)
+	$(PYTHON) $(SCRIPTS)/pilot_gate.py
 
 # HARD GUARD: no scanning without the frozen 500 sample.
 .PHONY: scan

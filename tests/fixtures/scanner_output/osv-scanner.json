@@ -1,0 +1,1 @@
+{"results":[{"source":{"path":"package-lock.json","type":"lockfile"},"packages":[{"package":{"name":"lodash","version":"4.17.15","ecosystem":"npm"},"vulnerabilities":[{"id":"GHSA-p6mc-m468-83gw","summary":"Prototype pollution in lodash"}]}]}]}

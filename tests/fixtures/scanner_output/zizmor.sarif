@@ -1,0 +1,1 @@
+{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"zizmor"}},"results":[{"ruleId":"template-injection","level":"error","message":{"text":"Potential template injection in workflow expression."},"locations":[{"physicalLocation":{"artifactLocation":{"uri":".github/workflows/ci.yml"},"region":{"startLine":20}}}]}]}]}

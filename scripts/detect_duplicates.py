@@ -39,8 +39,12 @@ except Exception:  # pragma: no cover
     import classify_projects as cp  # type: ignore
 
 STUDY_ROOT = common.STUDY_ROOT
-DEFAULT_JACCARD_THRESHOLD = 0.90
-MIN_PATHS_FOR_CLUSTERING = 5     # tiny trees are not reliably "duplicate"
+DEFAULT_JACCARD_THRESHOLD = 0.85
+MINHASH_PERM = 128
+LSH_BANDS = 32
+LSH_ROWS = 4                     # BANDS * ROWS must equal MINHASH_PERM
+MIN_SHINGLES = 5                 # below this, only EXACT-identical trees cluster
+_MERSENNE = (1 << 61) - 1
 
 DUP_FIELDS = [
     "repository_full_name",
@@ -50,12 +54,14 @@ DUP_FIELDS = [
     "is_representative",
     "is_duplicate",
     "duplicate_of",
-    "path_count",
+    "shingle_count",
 ]
 
 
 # =========================================================================== #
-# PURE FUNCTIONS
+# PURE FUNCTIONS — staged content-similarity (exact hash -> MinHash -> LSH ->
+# pairwise confirmation -> cluster). Scalable: LSH generates candidate pairs so
+# we never do all-pairs Jaccard.
 # =========================================================================== #
 def repo_signature(files: list[str], pkg_text: Optional[str]) -> dict:
     """Structural fingerprint: normalized tracked-path set + package name + deps."""
@@ -66,34 +72,79 @@ def repo_signature(files: list[str], pkg_text: Optional[str]) -> dict:
     return {"paths": paths, "name": name, "deps": deps}
 
 
+def shingle_set(sig: dict) -> frozenset:
+    """Content shingles: normalized paths + dependency + package-name tokens."""
+    toks = set(sig.get("paths") or ())
+    toks |= {f"dep::{d}" for d in (sig.get("deps") or ())}
+    if sig.get("name"):
+        toks.add(f"name::{sig['name']}")
+    return frozenset(toks)
+
+
+def exact_content_hash(shingles: frozenset) -> str:
+    return common.sha256_hex("\n".join(sorted(shingles)))
+
+
 def jaccard(a: frozenset, b: frozenset) -> float:
     if not a and not b:
         return 1.0
     if not a or not b:
         return 0.0
-    inter = len(a & b)
     union = len(a | b)
-    return inter / union if union else 0.0
+    return len(a & b) / union if union else 0.0
 
 
-def _similar(sig_a: dict, sig_b: dict, threshold: float) -> bool:
-    pa, pb = sig_a["paths"], sig_b["paths"]
-    if len(pa) < MIN_PATHS_FOR_CLUSTERING or len(pb) < MIN_PATHS_FOR_CLUSTERING:
-        return pa == pb and bool(pa)         # tiny trees only cluster if identical
-    if jaccard(pa, pb) >= threshold:
-        return True
-    # Exact dependency + name match with substantial overlap also links.
-    if sig_a["name"] and sig_a["name"] == sig_b["name"] and \
-            sig_a["deps"] and sig_a["deps"] == sig_b["deps"] and jaccard(pa, pb) >= 0.6:
-        return True
-    return False
+def _hash64(token: str) -> int:
+    import hashlib
+    return int.from_bytes(hashlib.sha1(token.encode("utf-8")).digest()[:8], "big")
 
 
-def cluster_signatures(signatures: dict[str, dict],
-                       threshold: float = DEFAULT_JACCARD_THRESHOLD) -> list[list[str]]:
-    """Union-find clustering over pairwise structural similarity. Returns groups
-    (including singletons) as sorted lists of repository names."""
-    names = sorted(signatures)
+def minhash_permutations(num_perm: int = MINHASH_PERM, seed: int = 20260711) -> list:
+    import random
+    rng = random.Random(seed)
+    return [(rng.randrange(1, _MERSENNE), rng.randrange(0, _MERSENNE))
+            for _ in range(num_perm)]
+
+
+def minhash_signature(shingles: frozenset, perms: list) -> tuple:
+    if not shingles:
+        return tuple([0] * len(perms))
+    hs = [_hash64(x) for x in shingles]
+    return tuple(min((a * h + b) % _MERSENNE for h in hs) for a, b in perms)
+
+
+def estimated_jaccard(sig_a: tuple, sig_b: tuple) -> float:
+    if not sig_a:
+        return 0.0
+    return sum(1 for x, y in zip(sig_a, sig_b) if x == y) / len(sig_a)
+
+
+def lsh_candidate_pairs(signatures: dict[str, tuple], bands: int = LSH_BANDS,
+                        rows: int = LSH_ROWS) -> set:
+    """Candidate near-duplicate pairs: repos colliding in >=1 LSH band."""
+    buckets: dict = {}
+    for name, sig in signatures.items():
+        for bi in range(bands):
+            band = sig[bi * rows:(bi + 1) * rows]
+            buckets.setdefault((bi, band), []).append(name)
+    pairs: set = set()
+    for members in buckets.values():
+        if len(members) > 1:
+            members = sorted(members)
+            for i in range(len(members)):
+                for j in range(i + 1, len(members)):
+                    pairs.add(frozenset((members[i], members[j])))
+    return pairs
+
+
+def cluster_repos(shingles_by_name: dict[str, frozenset], *,
+                  threshold: float = DEFAULT_JACCARD_THRESHOLD, seed: int = 20260711,
+                  perms: Optional[list] = None) -> list[list[str]]:
+    """Full staged clustering. Exact-identical trees always cluster; near duplicates
+    are found via MinHash+LSH candidate generation then pairwise-confirmed with exact
+    Jaccard >= threshold. Returns groups (incl. singletons) as sorted name lists."""
+    names = sorted(shingles_by_name)
+    perms = perms or minhash_permutations(MINHASH_PERM, seed)
     parent = {n: n for n in names}
 
     def find(x):
@@ -107,40 +158,41 @@ def cluster_signatures(signatures: dict[str, dict],
         if ra != rb:
             parent[max(ra, rb)] = min(ra, rb)
 
-    for i, a in enumerate(names):
-        for b in names[i + 1:]:
-            if _similar(signatures[a], signatures[b], threshold):
-                union(a, b)
+    # (1) exact-content-hash identical repos always merge (even tiny trees).
+    by_hash: dict = {}
+    for n in names:
+        by_hash.setdefault(exact_content_hash(shingles_by_name[n]), []).append(n)
+    for grp in by_hash.values():
+        for other in grp[1:]:
+            union(grp[0], other)
 
-    groups: dict[str, list[str]] = {}
+    # (2) MinHash+LSH candidate pairs among repos with enough shingles.
+    sigs = {n: minhash_signature(shingles_by_name[n], perms)
+            for n in names if len(shingles_by_name[n]) >= MIN_SHINGLES}
+    for pair in lsh_candidate_pairs(sigs):
+        a, b = sorted(pair)
+        # (3) pairwise confirmation with EXACT Jaccard.
+        if jaccard(shingles_by_name[a], shingles_by_name[b]) >= threshold:
+            union(a, b)
+
+    groups: dict = {}
     for n in names:
         groups.setdefault(find(n), []).append(n)
     return [sorted(g) for g in groups.values()]
 
 
-def choose_representative(cluster: list[str], metadata: dict, attribution: dict) -> str:
-    """Keep the most substantial member: attributed source lines, then stars, then oldest."""
-    def key(full: str):
-        attr = attribution.get(full, {})
-        meta = metadata.get(full, {})
-        attributed = attr.get("attributed_source_lines") or 0
-        stars = meta.get("stargazers_count") or 0
-        created = meta.get("created_at") or "9999"      # older (smaller) preferred
-        return (attributed, stars, _neg_str(created), full)
-    return max(cluster, key=key)
+def choose_representative(cluster: list[str]) -> str:
+    """PREDECLARED, outcome-independent rule: the lexicographically smallest
+    repository_full_name. Deliberately does NOT use Claude-attributed lines,
+    stars, or any scanner outcome (audit #14)."""
+    return min(cluster)
 
 
-def _neg_str(s: str) -> tuple:
-    # Sort helper: older created_at should rank higher, so invert lexical order.
-    return tuple(-ord(c) for c in s)
-
-
-def build_duplicate_records(clusters: list[list[str]], metadata: dict,
-                            attribution: dict, signatures: dict) -> list[dict]:
+def build_duplicate_records(clusters: list[list[str]],
+                            shingles_by_name: dict[str, frozenset]) -> list[dict]:
     rows: list[dict] = []
     for cid, cluster in enumerate(sorted(clusters, key=lambda c: c[0])):
-        rep = choose_representative(cluster, metadata, attribution) if len(cluster) > 1 \
-            else cluster[0]
+        rep = choose_representative(cluster)
         for full in cluster:
             is_rep = (full == rep)
             rows.append({
@@ -151,7 +203,7 @@ def build_duplicate_records(clusters: list[list[str]], metadata: dict,
                 "is_representative": is_rep,
                 "is_duplicate": (len(cluster) > 1 and not is_rep),
                 "duplicate_of": (rep if (len(cluster) > 1 and not is_rep) else None),
-                "path_count": len(signatures.get(full, {}).get("paths", ())),
+                "shingle_count": len(shingles_by_name.get(full, frozenset())),
             })
     return rows
 
@@ -184,9 +236,10 @@ FingerprintFn = Callable[[str, Optional[str], str], tuple[list, Optional[str]]]
 
 def detect_all(candidates: list[dict], metadata_by_name: dict[str, dict],
                attribution_by_name: dict[str, dict], raw_dir: Path, log_path: Path,
-               fingerprint_fn: FingerprintFn, threshold: float) -> tuple[list[dict], list[list[str]]]:
+               fingerprint_fn: FingerprintFn, threshold: float,
+               seed: int = 20260711) -> tuple[list[dict], list[list[str]]]:
     common.ensure_dir(raw_dir)
-    signatures: dict[str, dict] = {}
+    shingles_by_name: dict[str, frozenset] = {}
     unavailable: list[dict] = []
     seen: set[str] = set()
 
@@ -202,27 +255,25 @@ def detect_all(candidates: list[dict], metadata_by_name: dict[str, dict],
         cache = raw_dir / f"{vca._safe_name(full)}.json"
         if common.is_valid_json_file(cache):
             cached = common.read_json(cache)
-            signatures[full] = {"paths": frozenset(cached.get("paths", [])),
-                                "name": cached.get("name"),
-                                "deps": frozenset(cached.get("deps", []))}
+            shingles_by_name[full] = frozenset(cached.get("shingles", []))
             continue
         try:
             files, pkg_text = fingerprint_fn(
                 full, meta.get("default_branch"),
                 meta.get("repository_url") or f"https://github.com/{full}")
             sig = repo_signature(files, pkg_text)
+            shingles = shingle_set(sig)
         except Exception as exc:
             unavailable.append({"repository_full_name": full, "status": "READ_ERROR"})
             common.append_jsonl(log_path, {"ts": common.iso_now(),
                                            "repository_full_name": full,
                                            "status": "READ_ERROR", "error": f"{exc}"})
             continue
-        common.atomic_write_json(cache, {"paths": sorted(sig["paths"]),
-                                         "name": sig["name"], "deps": sorted(sig["deps"])})
-        signatures[full] = sig
+        common.atomic_write_json(cache, {"shingles": sorted(shingles)})
+        shingles_by_name[full] = shingles
 
-    clusters = cluster_signatures(signatures, threshold)
-    rows = build_duplicate_records(clusters, metadata_by_name, attribution_by_name, signatures)
+    clusters = cluster_repos(shingles_by_name, threshold=threshold, seed=seed)
+    rows = build_duplicate_records(clusters, shingles_by_name)
     rows.extend(unavailable)
     return rows, clusters
 

@@ -28,6 +28,17 @@ def test_build_population_record_joins_covariates():
     assert rec["deployment_evidence_level"] == "A"
 
 
+def test_population_record_carries_frozen_identity():
+    meta = {"repository_url": "https://github.com/octo/app",
+            "default_branch_head_sha": "abc123def456"}
+    rec = fp.build_population_record("octo/app", {"repository_eligible": True}, {}, meta,
+                                     {}, {}, {}, None, config_hash="CFGHASH")
+    assert rec["repository_url"] == "https://github.com/octo/app"
+    assert rec["frozen_commit_sha"] == "abc123def456"
+    assert rec["configuration_hash"] == "CFGHASH"
+    assert len(rec["metadata_snapshot_hash"]) == 64      # sha256 of the metadata record
+
+
 def test_canonical_checksum_is_order_independent():
     a = {"repository_full_name": "o/a", "track": "deployed"}
     b = {"repository_full_name": "o/b", "track": "repository_only"}

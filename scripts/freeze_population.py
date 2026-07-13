@@ -35,6 +35,10 @@ STUDY_ROOT = common.STUDY_ROOT
 POPULATION_FIELDS = [
     "repository_full_name",
     "owner",
+    "repository_url",
+    "frozen_commit_sha",
+    "metadata_snapshot_hash",
+    "configuration_hash",
     "repository_eligible",
     "deployed_eligible",
     "track",
@@ -57,14 +61,28 @@ POPULATION_FIELDS = [
 # =========================================================================== #
 # PURE FUNCTIONS
 # =========================================================================== #
+def metadata_snapshot_hash(meta: dict) -> str:
+    """Deterministic hash of the exact metadata record frozen for this repo."""
+    return common.sha256_hex(json.dumps(meta or {}, sort_keys=True, ensure_ascii=False))
+
+
+def config_bundle_hash() -> str:
+    """Hash of ALL config files, so a frozen record is tied to the exact config."""
+    return common.config_bundle_hash()
+
+
 def build_population_record(full: str, screen: dict, track: dict, meta: dict,
                             cls: dict, loc: dict, contrib: dict,
-                            provider: Optional[str]) -> dict:
+                            provider: Optional[str], config_hash: str = "") -> dict:
     screen, track = screen or {}, track or {}
     meta, cls, loc, contrib = meta or {}, cls or {}, loc or {}, contrib or {}
     return {
         "repository_full_name": full,
         "owner": full.split("/", 1)[0],
+        "repository_url": meta.get("repository_url") or f"https://github.com/{full}",
+        "frozen_commit_sha": meta.get("default_branch_head_sha"),
+        "metadata_snapshot_hash": metadata_snapshot_hash(meta),
+        "configuration_hash": config_hash,
         "repository_eligible": bool(screen.get("repository_eligible")),
         "deployed_eligible": bool(track.get("final_deployment_eligible")),
         "track": track.get("track", "excluded"),
@@ -149,6 +167,7 @@ def freeze(candidates: list[dict], screening: dict, track: dict, metadata: dict,
            classification: dict, loc: dict, contribution: dict,
            providers: dict, seed: int) -> tuple[list[dict], dict]:
     """Build population records for repository-side-eligible repos, then freeze."""
+    config_hash = config_bundle_hash()
     records: list[dict] = []
     seen: set[str] = set()
     for cand in candidates:
@@ -162,8 +181,9 @@ def freeze(candidates: list[dict], screening: dict, track: dict, metadata: dict,
         records.append(build_population_record(
             full, screen, track.get(full), metadata.get(full),
             classification.get(full), loc.get(full), contribution.get(full),
-            providers.get(full)))
+            providers.get(full), config_hash))
     manifest = build_checksum_manifest(records, seed)
+    manifest["configuration_hash"] = config_hash
     return records, manifest
 
 
@@ -218,6 +238,47 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     records, manifest = freeze(candidates, screening, track, metadata, classification,
                                loc, contribution, providers, seed)
+
+    # Two-check deployment policy (audit #8): a DEPLOYED-track repo must pass BOTH
+    # the screening (first) and pre-freeze (second) checks. The second check is
+    # independent (its own cache). A deployed repo lacking a passing two-check is
+    # downgraded to repository_only (deployment gate not satisfied twice).
+    try:
+        from . import verify_deployments as vdep  # type: ignore
+    except Exception:  # pragma: no cover
+        import verify_deployments as vdep  # type: ignore
+    first = _index(bpriv / "deployment-verification-first.json")
+    second = _index(bpriv / "deployment-verification-second.json")
+    downgraded = 0
+    for r in records:
+        if r.get("track") == "deployed":
+            full = r["repository_full_name"]
+            if not vdep.two_check_passed(first.get(full), second.get(full)):
+                r["track"] = "repository_only"
+                r["deployed_eligible"] = False
+                r["two_check_downgraded"] = True
+                downgraded += 1
+    if downgraded:
+        print(f"  two-check policy: {downgraded} deployed repo(s) downgraded to "
+              f"repository_only (did not pass both deployment checks).")
+
+    # Manual-review gate (audit #10): refuse to freeze while any eligible repo is
+    # still PENDING; drop human-EXCLUDEd repos.
+    try:
+        from . import resolve_manual_review as mrv  # type: ignore
+    except Exception:  # pragma: no cover
+        import resolve_manual_review as mrv  # type: ignore
+    decisions = mrv.read_decisions(bp / "manual-review-decisions.csv")
+    records, pending = mrv.apply_decisions(records, decisions)
+    if pending:
+        print("REFUSING TO FREEZE: unresolved manual-review (PENDING) cases:", file=sys.stderr)
+        for full in pending[:50]:
+            print(f"  {full}", file=sys.stderr)
+        print("Resolve each to INCLUDE/EXCLUDE in manual-review-decisions.csv "
+              "(run 'make resolve-review'), then re-freeze.", file=sys.stderr)
+        return 2
+    manifest = build_checksum_manifest(records, seed)
+    manifest["configuration_hash"] = config_bundle_hash()
 
     write_population(records, bp / "eligible-population.json", bp / "eligible-population.csv")
     write_checksum(manifest, bp / "eligible-population-checksum.txt")

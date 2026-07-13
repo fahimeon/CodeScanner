@@ -79,9 +79,33 @@ def test_no_package_json_and_language():
     assert "EX_NOT_JS_TS" in r["exclusion_codes"]
 
 
-def test_weak_attribution_excluded():
-    r = _screen(_meta(), _cls(), _loc(), _attr(qualifies=False))
-    assert "EX_WEAK_ATTRIBUTION" in r["exclusion_codes"]
+def test_strict_js_ts_rejects_webapp_without_measured_js_ts():
+    # Web app + package.json but NO measured JS/TS source -> EX_NOT_JS_TS (audit #11).
+    r = _screen(_meta(primary_language="Python"),
+                _cls(is_web_app=True, has_package_json=True, typescript_present=False,
+                     js_ts_file_count=0),
+                _loc(language_breakdown={"Python": 5000}), _attr())
+    assert "EX_NOT_JS_TS" in r["exclusion_codes"]
+
+
+def test_strict_js_ts_accepts_measured_js_ts_files():
+    r = _screen(_meta(primary_language="HTML"),
+                _cls(js_ts_file_count=5), _loc(language_breakdown={"HTML": 3000}), _attr())
+    assert "EX_NOT_JS_TS" not in r["exclusion_codes"]
+
+
+def test_weak_vs_non_substantive_attribution_codes():
+    # No attribution signal at all -> EX_WEAK_ATTRIBUTION.
+    weak = _screen(_meta(), _cls(), _loc(),
+                   _attr(qualifies=False, any_attribution_signal_found=False,
+                         attributed_non_merge_commits=0))
+    assert "EX_WEAK_ATTRIBUTION" in weak["exclusion_codes"]
+    # Has attributed commits but not substantial -> EX_NON_SUBSTANTIVE_CLAUDE_CHANGE.
+    nonsub = _screen(_meta(), _cls(), _loc(),
+                     _attr(qualifies=False, any_attribution_signal_found=True,
+                           attributed_non_merge_commits=2))
+    assert "EX_NON_SUBSTANTIVE_CLAUDE_CHANGE" in nonsub["exclusion_codes"]
+    assert "EX_WEAK_ATTRIBUTION" not in nonsub["exclusion_codes"]
 
 
 def test_unreachable_attribution_excluded():

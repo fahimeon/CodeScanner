@@ -115,9 +115,18 @@ def screen_repo(full_name: str, meta: Optional[dict], cls: Optional[dict],
     # --- language / package.json ---
     if not cls.get("has_package_json"):
         codes.append("EX_NO_PACKAGE_JSON")
+    # STRICT JS/TS (audit #11): require MEASURED JS/TS presence, not just a web app
+    # with a package.json. Accept if primary language is JS/TS, OR enough JS/TS
+    # source files, OR enough measured JS/TS LOC (tokei breakdown).
+    hr = cfg.get("_inclusion_hard_requirements", {})
+    min_files = hr.get("min_js_ts_source_files", 3)
+    min_js_ts_loc = hr.get("min_js_ts_loc", 100)
     lang = meta.get("primary_language")
-    language_ok = (lang in JS_TS) or cls.get("typescript_present") or \
-        (cls.get("is_web_app") and cls.get("has_package_json"))
+    breakdown = loc.get("language_breakdown") or {}
+    js_ts_loc = (breakdown.get("TypeScript", 0) + breakdown.get("JavaScript", 0)
+                 + breakdown.get("TSX", 0) + breakdown.get("JSX", 0))
+    js_ts_files = cls.get("js_ts_file_count") or 0
+    language_ok = ((lang in JS_TS) or js_ts_files >= min_files or js_ts_loc >= min_js_ts_loc)
     if not language_ok:
         codes.append("EX_NOT_JS_TS")
 
@@ -145,10 +154,16 @@ def screen_repo(full_name: str, meta: Optional[dict], cls: Optional[dict],
     # --- attribution (cohort-specific) ---
     if not control:
         if attr.get("status") == "OK":
-            if not attr.get("qualifies"):
+            if attr.get("qualifies"):
+                if not attr.get("reachable_qualifying_commit"):
+                    codes.append("EX_UNREACHABLE_CLAUDE_COMMIT")
+            elif attr.get("any_attribution_signal_found") and \
+                    (attr.get("attributed_non_merge_commits") or 0) > 0:
+                # Has attributed commits, but they are not SUBSTANTIVE (audit #11).
+                codes.append("EX_NON_SUBSTANTIVE_CLAUDE_CHANGE")
+            else:
+                # No detectable Claude attribution meeting substantiality.
                 codes.append("EX_WEAK_ATTRIBUTION")
-            elif not attr.get("reachable_qualifying_commit"):
-                codes.append("EX_UNREACHABLE_CLAUDE_COMMIT")
     else:
         # Controls must have ZERO detectable attribution signals.
         if attr.get("any_attribution_signal_found"):
@@ -268,6 +283,8 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     cfg = common.load_study_config()
     exclusion = common.load_yaml(common.CONFIG_DIR / "exclusion-rules.yaml")
+    inclusion = common.load_yaml(common.CONFIG_DIR / "inclusion-rules.yaml")
+    cfg["_inclusion_hard_requirements"] = inclusion.get("hard_requirements", {})
     precedence = exclusion.get("precedence", [])
     interim = STUDY_ROOT / cfg["paths"]["interim"]
     processed = STUDY_ROOT / cfg["paths"]["processed"]

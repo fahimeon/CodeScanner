@@ -6,7 +6,10 @@ Confirms a discovered deployment URL is reachable and classifies its status,
 using ONLY a non-invasive HEAD (GET fallback) on the discovered app URL. This
 NEVER logs in, submits forms, enumerates routes, sends payloads, crawls links,
 executes page JavaScript, or downloads large assets (see deployment-rules.yaml
-availability_check and README ethical restrictions). robots.txt is respected.
+availability_check and README ethical restrictions). All network I/O goes through
+net_safety (SSRF-safe: scheme/host/IP validation, redirect re-validation, IP
+pinning, single monotonic deadline, per-domain throttle, body cap). The prior
+/robots.txt pre-request was removed (audit P0 #1).
 
 While it has the (bounded, capped) page content, it also captures the
 non-invasive correspondence signals the match phase needs (does the page link
@@ -15,8 +18,8 @@ back to the repo, does the project name appear), so the raw body is never stored
 Deployment URLs / titles are PRIVATE -> data/private/. A URL-free status summary
 -> data/interim/.
 
-Design: pure classification (classify_availability / robots_allows /
-correspondence signals) split from an injectable `http_fn`, unit-tested offline.
+Design: pure classification (classify_availability / correspondence signals)
+split from an injectable `http_fn`, unit-tested offline.
 """
 
 from __future__ import annotations
@@ -81,45 +84,9 @@ TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
 # =========================================================================== #
 # PURE FUNCTIONS
 # =========================================================================== #
-def robots_allows(robots_text: Optional[str], user_agent: str, path: str = "/") -> bool:
-    """Minimal robots.txt check: does any applicable group Disallow `path`?
-    Fail-open only when there is no robots.txt at all (None)."""
-    if robots_text is None:
-        return True
-    ua_token = user_agent.split("/", 1)[0].lower()
-    groups: list[tuple[list[str], list[str]]] = []
-    agents: list[str] = []
-    disallows: list[str] = []
-
-    def _flush():
-        if agents:
-            groups.append((list(agents), list(disallows)))
-
-    for line in robots_text.splitlines():
-        line = line.split("#", 1)[0].strip()
-        if not line:
-            continue
-        key, _, val = line.partition(":")
-        key, val = key.strip().lower(), val.strip()
-        if key == "user-agent":
-            if disallows:            # new group starts after a rule block
-                _flush()
-                agents, disallows = [], []
-            agents.append(val.lower())
-        elif key == "disallow":
-            disallows.append(val)
-    _flush()
-
-    applicable: list[str] = []
-    for ua_list, dis in groups:
-        if any(a == "*" or ua_token in a for a in ua_list):
-            applicable.extend(dis)
-    for rule in applicable:
-        if rule == "":
-            continue            # "Disallow:" (empty) allows everything
-        if path.startswith(rule):
-            return False
-    return True
+# NOTE: the /robots.txt pre-request was removed (audit P0 #1). The only permitted
+# live interaction is a root HEAD and, when needed, one bounded root GET, performed
+# by the SSRF-safe net_safety.safe_fetch. No auxiliary crawling of robots.txt.
 
 
 def _match_error_page(title_body: str) -> Optional[str]:
@@ -151,9 +118,8 @@ def classify_availability(result: dict, cfg: dict) -> dict:
         return _status_record("DNS_FAILURE", cfg)
     if error == "tls":
         return _status_record("TLS_FAILURE", cfg)
-    if error == "robots":
-        return _status_record("UNKNOWN", cfg)         # not verified; unverifiable
     if error:
+        # rejected (SSRF guard) / deadline / too_large / connection -> unverifiable.
         return _status_record("UNKNOWN", cfg)
 
     title_body = f"{result.get('title') or ''} {result.get('body_snippet') or ''}"
@@ -225,6 +191,9 @@ def verify_one(full_name: str, discovery: dict, http_fn, cfg: dict) -> dict:
         "page_title": title,
         "repo_link_found": repo_link_found(result.get("body_snippet"), full_name),
         "name_in_page": name_in_page(title_body, full_name),
+        # Carried from discovery for the commit-relationship calculation (audit #9).
+        "deployment_sha": discovery.get("primary_deployment_sha"),
+        "deployment_ref": discovery.get("primary_deployment_ref"),
     }
 
 
@@ -289,69 +258,44 @@ def verify_all(discovery_records: list[dict], raw_dir: Path, log_path: Path,
 # Real non-invasive HTTP fetcher (stdlib urllib; HEAD then GET; capped)
 # --------------------------------------------------------------------------- #
 def make_http_fn(cfg: dict) -> HttpFn:
-    import urllib.request
-    import urllib.error
-    import urllib.parse
-    import socket
+    """SSRF-safe, non-invasive fetcher (net_safety): root HEAD then, when needed,
+    ONE bounded root GET, sharing a single monotonic deadline + per-domain throttle."""
+    import time
+    try:
+        from . import net_safety as ns  # type: ignore
+    except Exception:  # pragma: no cover
+        import net_safety as ns  # type: ignore
 
     ac = cfg["availability_check"]
-    ua = ac["user_agent"]
-    conn_timeout = ac.get("connection_timeout_seconds", 5)
-    max_bytes = ac.get("maximum_response_bytes", 1_000_000)
-    respect_robots = ac.get("respect_robots_txt", True)
+    policy = ns.FetchPolicy(
+        connect_timeout_s=ac.get("connection_timeout_seconds", 5),
+        total_deadline_s=ac.get("total_timeout_seconds", 15),
+        max_redirects=ac.get("maximum_redirects", 5),
+        max_body_bytes=ac.get("maximum_response_bytes", 1_000_000),
+        per_domain_per_minute=ac.get("requests_per_domain_per_minute", 10),
+        max_attempts=ac.get("maximum_verification_attempts", 2),
+        user_agent=ac.get("user_agent", "claude-deployed-security-study/0.1"),
+    )
+    throttle = ns.DomainThrottle(policy.per_domain_per_minute)
 
-    def _fetch(url: str, method: str) -> dict:
-        req = urllib.request.Request(url, method=method, headers={"User-Agent": ua})
-        try:
-            with urllib.request.urlopen(req, timeout=conn_timeout) as resp:
-                body = ""
-                if method == "GET":
-                    body = resp.read(max_bytes).decode("utf-8", errors="replace")
-                return {"http_status": resp.status, "final_url": resp.geturl(),
-                        "content_type": resp.headers.get("Content-Type", ""),
-                        "body_snippet": body, "title": extract_title(body), "error": None}
-        except urllib.error.HTTPError as e:
-            body = ""
-            try:
-                body = e.read(max_bytes).decode("utf-8", errors="replace")
-            except Exception:
-                pass
-            return {"http_status": e.code, "final_url": url,
-                    "content_type": e.headers.get("Content-Type", "") if e.headers else "",
-                    "body_snippet": body, "title": extract_title(body), "error": None}
-        except socket.timeout:
-            return {"http_status": None, "final_url": url, "error": "timeout"}
-        except urllib.error.URLError as e:
-            reason = str(getattr(e, "reason", e)).lower()
-            err = "dns" if ("name or service" in reason or "getaddrinfo" in reason) else \
-                  "tls" if ("certificate" in reason or "ssl" in reason) else \
-                  "timeout" if "timed out" in reason else "connection"
-            return {"http_status": None, "final_url": url, "error": err}
-        except Exception:
-            return {"http_status": None, "final_url": url, "error": "connection"}
-
-    def _robots_ok(url: str) -> bool:
-        if not respect_robots:
-            return True
-        parts = urllib.parse.urlsplit(url)
-        robots_url = urllib.parse.urlunsplit((parts.scheme, parts.netloc, "/robots.txt", "", ""))
-        r = _fetch(robots_url, "GET")
-        if r.get("error") or (r.get("http_status") or 0) >= 400:
-            return True                     # no usable robots -> allow the single root check
-        return robots_allows(r.get("body_snippet"), ua, parts.path or "/")
+    def _to_dict(r) -> dict:
+        return {"http_status": r.http_status, "final_url": r.final_url,
+                "error": r.error, "rejection_reason": r.rejection_reason,
+                "content_type": r.content_type, "body_snippet": r.body_snippet,
+                "title": extract_title(r.body_snippet)}
 
     def _fn(url: str) -> dict:
-        if not _robots_ok(url):
-            return {"http_status": None, "final_url": url, "error": "robots"}
-        head = _fetch(url, "HEAD")
-        # Fall back to GET when HEAD is unsupported or gave no useful signal.
-        if head.get("error") or (head.get("http_status") in (405, 501)) or \
-                (head.get("http_status") is None):
-            return _fetch(url, "GET")
-        # For a 2xx HEAD we still need body to classify error pages / correspondence.
-        if 200 <= (head.get("http_status") or 0) < 400:
-            return _fetch(url, "GET")
-        return head
+        deadline = time.monotonic() + policy.total_deadline_s
+        head = ns.safe_fetch(url, policy, method="HEAD", throttle=throttle, deadline=deadline)
+        if head.error:
+            return _to_dict(head)
+        # One bounded GET of the (already-validated) final URL to read the body for
+        # error-page + correspondence classification, under the SAME deadline.
+        get = ns.safe_fetch(head.final_url or url, policy, method="GET",
+                            throttle=throttle, deadline=deadline)
+        if get.error and get.http_status is None:
+            return _to_dict(head)           # keep the HEAD status if the GET failed
+        return _to_dict(get)
 
     return _fn
 
@@ -359,9 +303,25 @@ def make_http_fn(cfg: dict) -> HttpFn:
 # =========================================================================== #
 # main
 # =========================================================================== #
+def two_check_passed(first: Optional[dict], second: Optional[dict],
+                     temporary_states=("TIMEOUT", "SERVER_ERROR")) -> bool:
+    """Two-check policy (deployment-rules two_check_policy): qualifies if BOTH the
+    screening and pre-freeze checks are availability-eligible, OR the final check
+    is eligible and the earlier failure looks temporary."""
+    if not first or not second:
+        return False
+    if first.get("availability_eligible") and second.get("availability_eligible"):
+        return True
+    if second.get("availability_eligible") and first.get("deployment_status") in temporary_states:
+        return True
+    return False
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Non-invasive deployment availability (Phase 11-13).")
     parser.add_argument("--control", action="store_true")
+    parser.add_argument("--stage", choices=["first", "second"], default="first",
+                        help="first = eligibility-screening check; second = pre-freeze check")
     args = parser.parse_args(argv)
 
     cfg = common.load_study_config()
@@ -378,16 +338,26 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 2
     discovery_records = common.read_json(discovery_path)
 
-    raw_dir = base_private / "deployment-verification"
+    # STAGE-SPECIFIC storage + cache: the second (pre-freeze) check NEVER reuses the
+    # first (screening) check's cache — they are independent (audit #8).
+    stage = args.stage
+    raw_dir = base_private / f"deployment-verification-{stage}"
     log_path = STUDY_ROOT / cfg["paths"]["logs"] / (
-        "verify_deployments_control.jsonl" if args.control else "verify_deployments.jsonl")
+        f"verify_deployments_{stage}{'_control' if args.control else ''}.jsonl")
     http_fn = make_http_fn(deploy_cfg)
 
     rows = verify_all(discovery_records, raw_dir, log_path, http_fn, deploy_cfg)
     write_verification(rows,
-                       base_private / "deployment-verification.json",
-                       base_private / "deployment-verification.csv",
-                       base_interim / "deployment-verification-summary.csv")
+                       base_private / f"deployment-verification-{stage}.json",
+                       base_private / f"deployment-verification-{stage}.csv",
+                       base_interim / f"deployment-verification-{stage}-summary.csv")
+    # The match phase consumes the FIRST check; keep the canonical name pointing at it.
+    if stage == "first":
+        write_verification(rows,
+                           base_private / "deployment-verification.json",
+                           base_private / "deployment-verification.csv",
+                           base_interim / "deployment-verification-summary.csv")
+    print(f"[{stage} check] checked {len(rows)} deployments (non-invasive HEAD/GET on '/').")
 
     from collections import Counter
     statuses = Counter(r.get("deployment_status") for r in rows if r.get("status") == "OK")

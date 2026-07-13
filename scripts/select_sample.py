@@ -92,7 +92,7 @@ def stratified_sample(pool: list[dict], target_n: int, seed: int,
             if picked >= quotas.get(key, 0) or owner_count.get(owner, 0) >= max_per_owner:
                 leftovers.append(r)
                 continue
-            selected.append(r)
+            selected.append(dict(r))
             owner_count[owner] = owner_count.get(owner, 0) + 1
             picked += 1
 
@@ -103,9 +103,17 @@ def stratified_sample(pool: list[dict], target_n: int, seed: int,
         owner = _owner(r["repository_full_name"])
         if owner_count.get(owner, 0) >= max_per_owner:
             continue
-        selected.append(r)
+        selected.append(dict(r))
         owner_count[owner] = owner_count.get(owner, 0) + 1
 
+    # Per-stratum inclusion probability (selected / stratum size) on each record.
+    from collections import Counter
+    stratum_size = {k: len(v) for k, v in strata.items()}
+    chosen = Counter(tuple(r.get(s) for s in strata_keys) for r in selected)
+    for r in selected:
+        k = tuple(r.get(s) for s in strata_keys)
+        r["selection_probability"] = (round(chosen[k] / stratum_size[k], 4)
+                                      if stratum_size.get(k) else None)
     return selected
 
 
@@ -118,54 +126,95 @@ def assign_anonymous_ids(records: list[dict], prefix: str, width: int) -> list[d
     return out
 
 
+DEFAULT_EXACT_COVARIATES = ("size_bucket", "framework", "application_type", "deployment_provider")
+
+
+def compute_smd(treated_vals: list, control_vals: list) -> Optional[float]:
+    """Standardised mean difference between two numeric groups (covariate balance)."""
+    tv = [float(v) for v in treated_vals if isinstance(v, (int, float))]
+    cv = [float(v) for v in control_vals if isinstance(v, (int, float))]
+    if not tv or not cv:
+        return None
+    mt, mc = sum(tv) / len(tv), sum(cv) / len(cv)
+    var_t = sum((x - mt) ** 2 for x in tv) / len(tv)
+    var_c = sum((x - mc) ** 2 for x in cv) / len(cv)
+    pooled = ((var_t + var_c) / 2) ** 0.5
+    return round((mt - mc) / pooled, 4) if pooled else (0.0 if mt == mc else None)
+
+
 def match_controls(treated: list[dict], control_pool: list[dict], seed: int,
-                   strata_keys=STRATA_KEYS) -> list[dict]:
-    """1:1 nearest-neighbour control matching. Exact (size+framework) first, then
-    relaxed (size only / framework only), then nearest repo-age; else unmatched."""
+                   *, exact_covariates=DEFAULT_EXACT_COVARIATES, age_caliper_months: float = 6.0,
+                   require_control_deployment: bool = True) -> list[dict]:
+    """1:1 matching with a PREDECLARED caliper: a control must match EVERY exact
+    covariate, be within the repo-age caliper, and (for the deployed cohort) have
+    a verified deployment. Nearest age within the caliper wins. No silent relaxing
+    beyond the protocol: if nothing qualifies, the treated unit is unmatched with a
+    reason. Records distance + match quality."""
     rng = random.Random(seed)
     controls = sorted(control_pool, key=lambda r: r["repository_full_name"])
     rng.shuffle(controls)
     used: set[str] = set()
 
-    def _available():
-        return [c for c in controls if c["repository_full_name"] not in used]
-
     matches: list[dict] = []
     for t in sorted(treated, key=lambda r: r["repository_full_name"]):
-        tkey = tuple(t.get(s) for s in strata_keys)
-        chosen, quality = None, "unmatched"
-        avail = _available()
-        for c in avail:
-            if tuple(c.get(s) for s in strata_keys) == tkey:
-                chosen, quality = c, "exact"
-                break
-        if not chosen:
-            for c in avail:
-                if c.get("size_bucket") == t.get("size_bucket"):
-                    chosen, quality = c, "size_only"
-                    break
-        if not chosen:
-            for c in avail:
-                if c.get("framework") == t.get("framework"):
-                    chosen, quality = c, "framework_only"
-                    break
-        if not chosen and avail:
-            ta = t.get("repo_age_months") or 0
-            chosen = min(avail, key=lambda c: abs((c.get("repo_age_months") or 0) - ta))
-            quality = "nearest_age"
-        if chosen:
+        ta = t.get("repo_age_months")
+        candidates = []
+        strata_pool = 0
+        for c in controls:
+            if c["repository_full_name"] in used:
+                continue
+            if require_control_deployment and not (c.get("deployed_eligible")
+                                                   or c.get("track") == "deployed"):
+                continue
+            if any(c.get(k) != t.get(k) for k in exact_covariates):
+                continue
+            strata_pool += 1
+            ca = c.get("repo_age_months")
+            if ta is None or ca is None:
+                dist = None
+            else:
+                dist = abs(ca - ta)
+                if dist > age_caliper_months:
+                    continue
+            candidates.append((c, dist))
+
+        chosen, distance, quality, reason = None, None, "unmatched", None
+        if candidates:
+            chosen, distance = min(candidates, key=lambda cd: (cd[1] is None, cd[1] or 0.0))
+            quality = "exact_strata_within_caliper"
             used.add(chosen["repository_full_name"])
+        else:
+            reason = ("no_control_in_strata" if strata_pool == 0
+                      else "no_control_within_age_caliper")
         matches.append({
             "treated_repository": t["repository_full_name"],
             "treated_id": t.get("anonymous_id"),
             "control_repository": chosen["repository_full_name"] if chosen else None,
             "match_quality": quality,
+            "distance_age_months": distance,
+            "unmatched_reason": reason,
         })
     return matches
 
 
+def balance_report(treated: list[dict], control_pool: list[dict], matches: list[dict],
+                   covariates=("repo_age_months", "relevant_source_loc")) -> dict:
+    """Pre-match (all treated vs all controls) and post-match (matched pairs) SMD."""
+    ctrl_by_name = {c["repository_full_name"]: c for c in control_pool}
+    t_by_name = {t["repository_full_name"]: t for t in treated}
+    matched = [(t_by_name[m["treated_repository"]], ctrl_by_name[m["control_repository"]])
+               for m in matches if m.get("control_repository") in ctrl_by_name
+               and m["treated_repository"] in t_by_name]
+    out = {}
+    for cov in covariates:
+        pre = compute_smd([t.get(cov) for t in treated], [c.get(cov) for c in control_pool])
+        post = compute_smd([t.get(cov) for t, _ in matched], [c.get(cov) for _, c in matched])
+        out[cov] = {"smd_pre_match": pre, "smd_post_match": post}
+    return out
+
+
 def selection_report(deployed: list[dict], repo_only: list[dict],
-                     matches: list[dict], targets: dict) -> dict:
+                     matches: list[dict], targets: dict, balance: Optional[dict] = None) -> dict:
     from collections import Counter
     matched = sum(1 for m in matches if m["control_repository"])
     return {
@@ -176,9 +225,14 @@ def selection_report(deployed: list[dict], repo_only: list[dict],
         "repository_only": {"target": targets.get("repository_only"),
                             "selected": len(repo_only),
                             "shortfall": max(0, (targets.get("repository_only") or 0) - len(repo_only))},
-        "control_matching": {"treated_to_match": len(matches), "matched": matched,
-                             "match_rate": round(matched / len(matches), 4) if matches else None,
-                             "by_quality": dict(Counter(m["match_quality"] for m in matches))},
+        "control_matching": {
+            "treated_to_match": len(matches), "matched": matched,
+            "match_rate": round(matched / len(matches), 4) if matches else None,
+            "by_quality": dict(Counter(m["match_quality"] for m in matches)),
+            "unmatched_reasons": dict(Counter(m.get("unmatched_reason") for m in matches
+                                              if m.get("unmatched_reason"))),
+        },
+        "covariate_balance": balance or {},
     }
 
 
@@ -197,11 +251,18 @@ def _write_csv(path: Path, records: list[dict], fields: list[str]) -> None:
     os.replace(tmp, path)
 
 
-SELECTED_FIELDS = ["anonymous_id", "repository_full_name", "owner", "track",
-                   "size_bucket", "framework", "application_type", "involvement_band",
-                   "deployment_provider", "deployment_evidence_level",
-                   "relevant_source_loc", "repo_age_months"]
-MATCH_FIELDS = ["treated_id", "treated_repository", "control_repository", "match_quality"]
+SELECTED_FIELDS = ["anonymous_id", "repository_full_name", "owner", "repository_url",
+                   "frozen_commit_sha", "metadata_snapshot_hash", "configuration_hash",
+                   "track", "size_bucket", "framework", "application_type",
+                   "involvement_band", "deployment_provider", "deployment_evidence_level",
+                   "relevant_source_loc", "repo_age_months",
+                   "selection_seed", "selection_timestamp", "selection_probability"]
+MATCH_FIELDS = ["treated_id", "treated_repository", "control_repository", "match_quality",
+                "distance_age_months", "unmatched_reason"]
+# PUBLIC table: anonymous id + design covariates ONLY — no identities (audit #12).
+PUBLIC_FIELDS = ["anonymous_id", "track", "size_bucket", "framework", "application_type",
+                 "involvement_band", "deployment_provider", "deployment_evidence_level",
+                 "relevant_source_loc", "repo_age_months", "selection_probability"]
 
 
 # =========================================================================== #
@@ -209,7 +270,7 @@ MATCH_FIELDS = ["treated_id", "treated_repository", "control_repository", "match
 # =========================================================================== #
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Select samples + match controls (Phase 18).")
-    args = parser.parse_args(argv)
+    parser.parse_args(argv)
 
     cfg = common.load_study_config()
     seed = int(cfg.get("reproducibility", {}).get("random_seed", 20260711))
@@ -233,28 +294,64 @@ def main(argv: Optional[list[str]] = None) -> int:
     deployed_target = int(tracks.get("deployed", {}).get("target_n", 500))
     repo_only_target = int(tracks.get("repository_only", {}).get("target_n", 500))
 
+    width = int(anon.get("id_width", 4))
+    # Globally-unique prefixes across tracks (audit #12): deployed vs repository-only.
     deployed = assign_anonymous_ids(
         stratified_sample(deployed_pool, deployed_target, seed, max_per_owner),
-        anon.get("treated_id_prefix", "CLR"), int(anon.get("id_width", 4)))
+        anon.get("treated_id_prefix", "CLR"), width)
     repo_only = assign_anonymous_ids(
         stratified_sample(repo_only_pool, repo_only_target, seed + 1, max_per_owner),
-        anon.get("treated_id_prefix", "CLR"), int(anon.get("id_width", 4)))
+        anon.get("repository_only_id_prefix", "CLO"), width)
+
+    # Stamp run-level selection provenance onto each selected record.
+    selection_ts = common.iso_now()
+    for rec in deployed + repo_only:
+        rec["selection_seed"] = seed
+        rec["selection_timestamp"] = selection_ts
 
     # Control pool from the control-cohort frozen population, if present.
     control_pop_path = processed / "control" / "eligible-population.json"
     control_pool = common.read_json(control_pop_path) if control_pop_path.exists() else []
     control_pool = [r for r in control_pool if r.get("repository_eligible")]
-    matches = match_controls(deployed, control_pool, seed)
+    m_cfg = cfg.get("control_cohort", {}).get("matching", {})
+    caliper = float(m_cfg.get("age_caliper_months", 6))
+    exact_cov = tuple(m_cfg.get("exact_covariates", DEFAULT_EXACT_COVARIATES))
+    matches = match_controls(deployed, control_pool, seed, exact_covariates=exact_cov,
+                             age_caliper_months=caliper,
+                             require_control_deployment=bool(
+                                 m_cfg.get("require_control_deployment_for_deployed", True)))
+    balance = balance_report(deployed, control_pool, matches,
+                             tuple(m_cfg.get("balance_covariates", ("repo_age_months",
+                                                                    "relevant_source_loc"))))
+
+    report = selection_report(deployed, repo_only, matches,
+                              {"deployed": deployed_target, "repository_only": repo_only_target},
+                              balance)
+
+    # TARGET POLICY (audit #12): exact_or_refuse aborts on shortfall without
+    # writing the SELECTED marker; up_to_target proceeds and reports the shortfall.
+    policy = cfg.get("sampling", {}).get("target_policy", "up_to_target")
+    if policy == "exact_or_refuse" and (report["deployed"]["shortfall"]
+                                        or report["repository_only"]["shortfall"]):
+        print(f"REFUSING TO SELECT (exact_or_refuse): deployed "
+              f"{len(deployed)}/{deployed_target}, repository_only "
+              f"{len(repo_only)}/{repo_only_target}. Criteria are never weakened; "
+              f"switch sampling.target_policy to 'up_to_target' to accept a shortfall.",
+              file=sys.stderr)
+        common.atomic_write_json(processed / "selection-report.json", report)
+        return 2
 
     _write_csv(processed / "selected-500-repositories.csv", deployed, SELECTED_FIELDS)
     _write_csv(processed / "selected-repository-only.csv", repo_only, SELECTED_FIELDS)
     _write_csv(processed / "control-matches.csv", matches, MATCH_FIELDS)
-    report = selection_report(deployed, repo_only, matches,
-                              {"deployed": deployed_target, "repository_only": repo_only_target})
+    # PUBLIC tables: covariates + anonymous ids only (no identities).
+    public_dir = STUDY_ROOT / cfg["paths"]["public"]
+    _write_csv(public_dir / "selected-deployed-public.csv", deployed, PUBLIC_FIELDS)
+    _write_csv(public_dir / "selected-repository-only-public.csv", repo_only, PUBLIC_FIELDS)
     common.atomic_write_json(processed / "selection-report.json", report)
 
     print(f"Selected deployed: {len(deployed)}/{deployed_target}; "
-          f"repository_only: {len(repo_only)}/{repo_only_target}.")
+          f"repository_only: {len(repo_only)}/{repo_only_target} (policy={policy}).")
     if not control_pool:
         print("  NOTE: no control population found (run the control pipeline + 'make freeze' "
               "with --control); control matching skipped.")

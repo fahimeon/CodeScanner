@@ -252,6 +252,21 @@ execution_statuses:
 treat_failure_as_zero_findings: false
 
 # -----------------------------------------------------------------------------
+# Scanner exit-code semantics (pinned to the Dockerfile-pinned versions).
+# `ok`       = exit codes meaning the scan ran and found NOTHING.
+# `findings` = exit codes meaning the scan ran successfully and DID find issues.
+# Any exit code NOT in (ok + findings) is a genuine execution failure
+# (SCANNER_ERROR). A "findings" exit code MUST NOT be treated as an error.
+# -----------------------------------------------------------------------------
+exit_semantics:
+  gitleaks:         { ok: [0], findings: [] }   # working-tree scan; entrypoint forces --exit-code 0
+  gitleaks-history: { ok: [0], findings: [] }   # git-history scan (separate mirror clone)
+  semgrep:     { ok: [0], findings: [1] }        # 1 = results found; >=2 = error (no --error flag)
+  trivy:       { ok: [0], findings: [] }         # no --exit-code set -> always 0 on success
+  osv-scanner: { ok: [0], findings: [1] }        # 1 = vulnerabilities found; 127/128 = error
+  zizmor:      { ok: [0], findings: [1, 13, 14] } # nonzero finding/persona codes (v1.x)
+
+# -----------------------------------------------------------------------------
 # Pilot before full run
 # -----------------------------------------------------------------------------
 pilot:

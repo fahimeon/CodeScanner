@@ -1,0 +1,1 @@
+{"SchemaVersion":2,"Results":[{"Target":"package-lock.json","Class":"lang-pkgs","Type":"npm","Vulnerabilities":[{"VulnerabilityID":"CVE-2020-8203","PkgName":"lodash","InstalledVersion":"4.17.15","FixedVersion":"4.17.19","Severity":"HIGH"}]}]}

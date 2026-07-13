@@ -71,13 +71,37 @@ def correspondence_signals(verify: dict) -> list[str]:
     return signals
 
 
-def finalize_match(full_name: str, verify: Optional[dict], screen: Optional[dict]) -> dict:
+def compute_commit_relationship(deployed_sha, reference_sha, is_ancestor=None) -> str:
+    """Relationship of the deployed commit to the repo's reference commit.
+
+    Returns EXACT_COMMIT / DEPLOYED_COMMIT_IS_ANCESTOR / DEPLOYED_COMMIT_IS_DESCENDANT
+    / DIFFERENT_BRANCH / UNKNOWN. Stays UNKNOWN when the deployed SHA is unavailable
+    (the common case) or when no ancestry oracle is provided. `is_ancestor(a, b)`
+    must return True iff commit a is an ancestor of commit b. NEVER guesses.
+    """
+    if not deployed_sha or not reference_sha:
+        return "UNKNOWN"
+    if deployed_sha == reference_sha:
+        return "EXACT_COMMIT"
+    if is_ancestor is None:
+        return "UNKNOWN"                      # cannot decide without the git graph
+    if is_ancestor(deployed_sha, reference_sha):
+        return "DEPLOYED_COMMIT_IS_ANCESTOR"
+    if is_ancestor(reference_sha, deployed_sha):
+        return "DEPLOYED_COMMIT_IS_DESCENDANT"
+    return "DIFFERENT_BRANCH"
+
+
+def finalize_match(full_name: str, verify: Optional[dict], screen: Optional[dict],
+                   reference_sha: Optional[str] = None, is_ancestor=None) -> dict:
     """Combine availability + correspondence + repository-side eligibility into a
     track. Never invents a deployment: missing verification => repository_only/excluded."""
     repo_eligible = bool((screen or {}).get("repository_eligible"))
     verify = verify or {}
     level = verify.get("best_evidence_level")
     avail_eligible = bool(verify.get("availability_eligible"))
+    relationship = compute_commit_relationship(
+        verify.get("deployment_sha"), reference_sha, is_ancestor)
 
     signals = correspondence_signals(verify)
     # minimum_signals_required = 1 (Level A implies metadata; B/C need >=1 extra,
@@ -102,7 +126,7 @@ def finalize_match(full_name: str, verify: Optional[dict], screen: Optional[dict
         "correspondence_signals": signals,
         "corresponds": corresponds,
         "final_deployment_eligible": final_deployment_eligible,
-        "deployment_commit_relationship": "UNKNOWN",   # providers rarely expose deployed SHA
+        "deployment_commit_relationship": relationship,   # UNKNOWN unless a deployed SHA is known
         "track": track,
     }
 

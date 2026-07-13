@@ -39,6 +39,8 @@ data/processed/
 
 # ---- Scanner rule caches / vuln DB snapshots (large, reproducible) ----
 config/semgrep-rules-cache/
+config/trivy-cache/
+config/osv-db/
 .trivycache/
 .cache/
 

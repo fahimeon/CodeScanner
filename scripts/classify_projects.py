@@ -47,10 +47,16 @@ BAAS_DEPENDENCIES = ["@supabase/supabase-js", "supabase", "firebase", "@firebase
 SERVERLESS_FILES = ["vercel.json", "netlify.toml", "serverless.yml", "serverless.yaml",
                     "wrangler.toml", "netlify/functions", "functions"]
 
+JS_TS_SOURCE_EXTS = {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".cts", ".mts",
+                     ".vue", ".svelte", ".astro"}
+_EXCLUDED_DIR_SEGMENTS = ("node_modules/", "dist/", "build/", ".next/", ".nuxt/",
+                          "vendor/", "out/", "coverage/", ".svelte-kit/")
+
 CLASSIFICATION_FIELDS = [
     "repository_full_name",
     "status",                       # OK | UNAVAILABLE | READ_ERROR
     "is_web_app",
+    "js_ts_file_count",
     "application_type",
     "framework",
     "meta_framework",
@@ -122,6 +128,23 @@ def all_dependencies(pkg: Optional[dict]) -> set[str]:
 
 def _matched(deps: set[str], candidates: list[str]) -> list[str]:
     return [c for c in candidates if c in deps]
+
+
+def count_js_ts_files(files: set[str]) -> int:
+    """Number of JavaScript/TypeScript source files outside vendored/build trees.
+    Used for STRICT JS/TS eligibility (measured presence, not just package.json)."""
+    n = 0
+    for p in files:
+        pn = _norm(p)
+        if any(seg in ("/" + pn) for seg in _EXCLUDED_DIR_SEGMENTS):
+            continue
+        base = pn.rsplit("/", 1)[-1]
+        if base.endswith(".d.ts"):
+            continue
+        ext = os.path.splitext(base)[1].lower()
+        if ext in JS_TS_SOURCE_EXTS:
+            n += 1
+    return n
 
 
 def detect_tech_indicators(files: set[str]) -> dict:
@@ -257,6 +280,7 @@ def classify_repo(full_name: str, files: list[str], pkg_text: Optional[str],
         "repository_full_name": full_name,
         "status": "OK",
         "is_web_app": web["is_web_app"],
+        "js_ts_file_count": count_js_ts_files(file_set),
         "application_type": app_type,
         "framework": framework,
         "meta_framework": meta_framework,
