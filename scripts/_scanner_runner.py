@@ -128,11 +128,22 @@ FINDING_PARSERS = {
 }
 
 
-def classify_execution(exit_code: int, timed_out: bool,
-                       finding_count: Optional[int]) -> str:
+def exit_semantics_for(scanner: str, scanner_cfg: Optional[dict] = None) -> tuple[set, set]:
+    """(ok_codes, findings_codes) for a scanner from scanner-config exit_semantics."""
+    if scanner_cfg is None:
+        scanner_cfg = common.load_yaml(common.CONFIG_DIR / "scanner-config.yaml")
+    sem = (scanner_cfg.get("exit_semantics") or {}).get(scanner, {})
+    return set(sem.get("ok", [0])), set(sem.get("findings", []))
+
+
+def classify_execution(exit_code: int, timed_out: bool, finding_count: Optional[int],
+                       accepted_exit_codes: Optional[set] = None) -> str:
+    """Classify one scanner run. A scanner-specific 'findings' exit code counts as
+    a successful run (accepted_exit_codes must include it), NOT a SCANNER_ERROR."""
     if timed_out:
         return "TIMEOUT"
-    if exit_code != 0:
+    accepted = accepted_exit_codes if accepted_exit_codes is not None else {0}
+    if exit_code not in accepted:
         return "SCANNER_ERROR"
     if finding_count is None:
         return "PARSER_ERROR"
@@ -148,9 +159,14 @@ RunFn = Callable[[list], tuple]
 def run_one(scanner: str, repo_full: str, anon_id: Optional[str], commit_sha: Optional[str],
             repo_container_path: str, output_host: Path, output_container_path: str,
             mounts: list[tuple], image: str, isolation: dict,
-            run_fn: RunFn, docker: str = "docker") -> dict:
+            run_fn: RunFn, docker: str = "docker",
+            accepted_exit_codes: Optional[set] = None) -> dict:
     """Run one scanner on one repo; the container writes `output_host`. Returns an
-    execution record. Never treats a scanner failure as zero findings."""
+    execution record. A scanner-specific 'findings' exit code is a success (its
+    output is parsed); a genuine failure is never recorded as zero findings."""
+    if accepted_exit_codes is None:
+        ok, findings = exit_semantics_for(scanner)
+        accepted_exit_codes = ok | findings
     argv = build_docker_run_args(scanner, repo_container_path, output_container_path,
                                  mounts, image, isolation)
     common.ensure_dir(output_host.parent)
@@ -163,11 +179,12 @@ def run_one(scanner: str, repo_full: str, anon_id: Optional[str], commit_sha: Op
     duration = round(time.monotonic() - start, 2)
 
     finding_count: Optional[int] = None
-    if rc == 0 and not timed_out and output_host.exists():
+    # Parse output for ANY accepted exit code (incl. the findings code), not just 0.
+    if rc in accepted_exit_codes and not timed_out and output_host.exists():
         finding_count = FINDING_PARSERS[scanner](
             output_host.read_text(encoding="utf-8", errors="replace"))
 
-    status = classify_execution(rc, timed_out, finding_count)
+    status = classify_execution(rc, timed_out, finding_count, accepted_exit_codes)
     return {
         "repository_full_name": repo_full,
         "anonymous_id": anon_id,
@@ -202,6 +219,8 @@ def run_all(scanner: str, clone_manifest: list[dict], run_fn: RunFn, *,
     results_raw = STUDY_ROOT / cfg["paths"]["results_raw"] / scanner
     log_path = STUDY_ROOT / cfg["paths"]["logs"] / f"run_{scanner.replace('-', '_')}.jsonl"
     ext = OUTPUT_EXT[scanner]
+    ok_codes, finding_codes = exit_semantics_for(scanner, scanner_cfg)
+    accepted = ok_codes | finding_codes
 
     records: list[dict] = []
     for entry in clone_manifest:
@@ -225,7 +244,7 @@ def run_all(scanner: str, clone_manifest: list[dict], run_fn: RunFn, *,
             scanner, full, entry.get("anonymous_id"), entry.get("checked_out_sha"),
             f"/scan/repositories/{safe}", output_host,
             f"/scan/results/raw/{scanner}/{safe}.{ext}", mounts, image, isolation,
-            run_fn, docker)
+            run_fn, docker, accepted_exit_codes=accepted)
         records.append(rec)
         common.append_jsonl(log_path, {"ts": common.iso_now(), **{
             k: rec[k] for k in ("repository_full_name", "status", "finding_count", "exit_code")}})

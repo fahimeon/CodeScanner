@@ -1,0 +1,1 @@
+{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"semgrep"}},"results":[{"ruleId":"javascript.express.security.audit.xss.direct-response-write","level":"error","message":{"text":"Detected directly writing user input to the HTTP response (XSS)."},"locations":[{"physicalLocation":{"artifactLocation":{"uri":"src/routes/user.ts"},"region":{"startLine":42}}}]}]}]}

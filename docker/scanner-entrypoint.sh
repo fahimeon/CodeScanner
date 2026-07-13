@@ -52,12 +52,15 @@ case "$SCANNER" in
   semgrep)
     # Offline: use pre-fetched pinned rules mounted at /scan/semgrep-rules.
     export SEMGREP_SEND_METRICS=off
+    # NOTE: --error removed (audit P0 #2) so "findings found" is exit 1, not a hard
+    # failure; the host runner treats exit 1 as SUCCESS_WITH_FINDINGS per
+    # scanner-config.yaml exit_semantics. >=2 remains a genuine error.
     exec semgrep scan \
         --config /scan/semgrep-rules \
         --metrics=off \
         --sarif \
         --output "$OUTPUT_PATH" \
-        --error --disable-version-check \
+        --disable-version-check \
         "$REPO_PATH" "$@"
     ;;
 

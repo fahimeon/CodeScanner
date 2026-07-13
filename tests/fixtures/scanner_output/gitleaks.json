@@ -1,0 +1,3 @@
+[
+  {"RuleID":"generic-api-key","Description":"Generic API Key","File":"src/config.ts","StartLine":12,"EndLine":12,"Secret":"REDACTED","Match":"apiKey = REDACTED","Commit":"","Author":"","Email":""}
+]

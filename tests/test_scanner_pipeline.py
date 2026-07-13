@@ -4,6 +4,8 @@ and the shared scanner harness (all offline; docker/git behind injected runners)
 import json
 from pathlib import Path
 
+import pytest
+
 import prepare_scanners as ps
 import clone_selected_repositories as cl
 import _scanner_runner as sr
@@ -129,6 +131,57 @@ def test_classify_execution():
     assert sr.classify_execution(0, False, None) == "PARSER_ERROR"
     assert sr.classify_execution(2, False, None) == "SCANNER_ERROR"
     assert sr.classify_execution(0, True, None) == "TIMEOUT"
+
+
+# --- scanner-specific exit-code semantics (audit P0 #2) --------------------- #
+def test_exit_semantics_from_config():
+    ok, findings = sr.exit_semantics_for("semgrep")
+    assert 0 in ok and 1 in findings          # 1 = results found
+    ok, findings = sr.exit_semantics_for("osv-scanner")
+    assert 1 in findings
+    ok, findings = sr.exit_semantics_for("gitleaks")
+    assert findings == set()                  # entrypoint forces --exit-code 0
+
+
+def test_findings_exit_code_is_success_not_error():
+    ok, findings = sr.exit_semantics_for("semgrep")
+    accepted = ok | findings
+    # Semgrep exit 1 with findings parsed => SUCCESS_WITH_FINDINGS, NOT SCANNER_ERROR.
+    assert sr.classify_execution(1, False, 3, accepted) == "SUCCESS_WITH_FINDINGS"
+    # Exit 2 is a genuine error for semgrep.
+    assert sr.classify_execution(2, False, None, accepted) == "SCANNER_ERROR"
+    # OSV exit 1 = vulnerabilities found.
+    ok2, f2 = sr.exit_semantics_for("osv-scanner")
+    assert sr.classify_execution(1, False, 2, ok2 | f2) == "SUCCESS_WITH_FINDINGS"
+
+
+@pytest.mark.parametrize("scanner,ext", [
+    ("gitleaks", "json"), ("semgrep", "sarif"), ("trivy", "json"),
+    ("osv-scanner", "json"), ("zizmor", "sarif"),
+])
+def test_positive_fixture_yields_success_with_findings(scanner, ext, tmp_path):
+    """Each scanner's synthetic positive fixture: output parses, status is
+    SUCCESS_WITH_FINDINGS, finding_count>0, and no real secret is present."""
+    fixture = (Path(__file__).resolve().parent / "fixtures" / "scanner_output" /
+               f"{scanner}.{ext}")
+    fixture_text = fixture.read_text(encoding="utf-8")
+    assert "REDACTED" in fixture_text or "Secret" not in fixture_text  # no real secret
+
+    ok, findings = sr.exit_semantics_for(scanner)
+    exit_code = (sorted(findings)[0] if findings else 0)   # simulate the scanner's exit
+    output_host = tmp_path / "raw" / scanner / f"o__r.{ext}"
+
+    def run_fn(cmd):
+        output_host.parent.mkdir(parents=True, exist_ok=True)
+        output_host.write_text(fixture_text, encoding="utf-8")
+        return exit_code, "", ""
+
+    rec = sr.run_one(scanner, "o/r", "CLR-0001", "sha1",
+                     f"/scan/repositories/o__r", output_host,
+                     f"/scan/results/raw/{scanner}/o__r.{ext}", [], "img",
+                     {"limits": {}}, run_fn, accepted_exit_codes=(ok | findings))
+    assert rec["status"] == "SUCCESS_WITH_FINDINGS", rec
+    assert rec["finding_count"] and rec["finding_count"] > 0
 
 
 def test_run_one_reads_container_output_and_records(tmp_path):
