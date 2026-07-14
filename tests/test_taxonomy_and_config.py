@@ -195,7 +195,8 @@ def test_entrypoint_binds_explicit_offline_asset_paths():
     assert not re.search(r"(?<!-)--offline(?![\w-])", osv_block)   # osv must not use bare --offline
     # zizmor 1.x has no --output flag: it must redirect stdout to the output path.
     zizmor_block = raw.split("zizmor)", 1)[1].split(";;", 1)[0]
-    assert "--output" not in zizmor_block and '> "$OUTPUT_PATH"' in zizmor_block
+    zizmor_code = "\n".join(l for l in zizmor_block.splitlines() if not l.strip().startswith("#"))
+    assert "--output" not in zizmor_code and '> "$OUTPUT_PATH"' in zizmor_code
 
 
 def test_trivy_github_actions_disabled():
