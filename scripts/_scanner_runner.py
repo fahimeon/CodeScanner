@@ -91,35 +91,65 @@ def _load(text: str):
         return None
 
 
+# CS-012: a parser returns None (=> PARSER_ERROR) whenever the JSON is valid but
+# does NOT match the scanner's expected schema, so version drift, an error-envelope
+# JSON, or a placeholder file can never be miscounted as a genuine NO_FINDINGS.
+_MISSING = object()
+
+
 def count_gitleaks(text: str) -> Optional[int]:
     obj = _load(text)
-    if obj is None:
-        return None
-    return len(obj) if isinstance(obj, list) else 0
+    # Gitleaks JSON reports are a top-level ARRAY. A dict/scalar is the wrong
+    # schema (e.g. an error object) -> PARSER_ERROR, not zero findings.
+    return len(obj) if isinstance(obj, list) else None
 
 
-def _count_sarif(text: str) -> Optional[int]:
+def _count_sarif(text: str, expected_tool: Optional[str] = None) -> Optional[int]:
     obj = _load(text)
     if not isinstance(obj, dict):
         return None
-    runs = obj.get("runs")
-    if not isinstance(runs, list):
-        return 0
-    return sum(len(r.get("results") or []) for r in runs if isinstance(r, dict))
+    # A SARIF log MUST carry `version` and a `runs` list; otherwise it is not a
+    # SARIF document and must not be read as zero findings.
+    if "version" not in obj or not isinstance(obj.get("runs"), list):
+        return None
+    total = 0
+    for run in obj["runs"]:
+        if not isinstance(run, dict):
+            return None
+        if expected_tool:                        # reject another tool's SARIF (identity)
+            driver = (((run.get("tool") or {}).get("driver") or {}).get("name") or "").lower()
+            if driver and expected_tool not in driver:
+                return None
+        results = run.get("results") or []
+        if not isinstance(results, list):
+            return None
+        total += len(results)
+    return total
 
 
-count_semgrep = _count_sarif
-count_zizmor = _count_sarif
+def count_semgrep(text: str) -> Optional[int]:
+    return _count_sarif(text, "semgrep")
+
+
+def count_zizmor(text: str) -> Optional[int]:
+    return _count_sarif(text, "zizmor")
 
 
 def count_trivy(text: str) -> Optional[int]:
     obj = _load(text)
     if not isinstance(obj, dict):
         return None
+    results = obj.get("Results", _MISSING)
+    if results is _MISSING:                       # no Results key -> not Trivy output
+        return None
+    if results is None:                           # Trivy emits null for an empty scan
+        return 0
+    if not isinstance(results, list):
+        return None
     total = 0
-    for res in obj.get("Results") or []:
+    for res in results:
         if not isinstance(res, dict):
-            continue
+            return None
         for key in ("Vulnerabilities", "Misconfigurations", "Secrets"):
             total += len(res.get(key) or [])
     return total
@@ -129,9 +159,18 @@ def count_osv(text: str) -> Optional[int]:
     obj = _load(text)
     if not isinstance(obj, dict):
         return None
+    results = obj.get("results", _MISSING)
+    if results is _MISSING:                       # no results key -> not OSV output
+        return None
+    if results is None:
+        return 0
+    if not isinstance(results, list):
+        return None
     total = 0
-    for res in obj.get("results") or []:
-        for pkg in (res.get("packages") or []) if isinstance(res, dict) else []:
+    for res in results:
+        if not isinstance(res, dict):
+            return None
+        for pkg in (res.get("packages") or []):
             total += len(pkg.get("vulnerabilities") or []) if isinstance(pkg, dict) else 0
     return total
 

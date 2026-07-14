@@ -237,7 +237,7 @@ def test_finding_count_parsers():
     assert sr.count_gitleaks(json.dumps([{"a": 1}, {"b": 2}])) == 2
     assert sr.count_gitleaks(json.dumps([])) == 0
     assert sr.count_gitleaks("not json") is None
-    sarif = json.dumps({"runs": [{"results": [1, 2, 3]}, {"results": [4]}]})
+    sarif = json.dumps({"version": "2.1.0", "runs": [{"results": [1, 2, 3]}, {"results": [4]}]})
     assert sr.count_semgrep(sarif) == 4
     trivy = json.dumps({"Results": [{"Vulnerabilities": [1, 2], "Secrets": [3]},
                                     {"Misconfigurations": [4]}]})
@@ -245,6 +245,44 @@ def test_finding_count_parsers():
     osv = json.dumps({"results": [{"packages": [{"vulnerabilities": [1, 2]},
                                                 {"vulnerabilities": [3]}]}]})
     assert sr.count_osv(osv) == 3
+
+
+# --- CS-012: valid JSON with the WRONG schema must be PARSER_ERROR, not zero -- #
+def test_wrong_schema_json_is_parser_error_not_zero():
+    err = json.dumps({"error": "rate limited", "code": 429})     # error-envelope JSON
+    # None (=> PARSER_ERROR) for every scanner; a real empty scan (below) is 0.
+    assert sr.count_gitleaks(err) is None                        # gitleaks report is an array
+    assert sr.count_semgrep(err) is None                         # no version/runs
+    assert sr.count_zizmor(err) is None
+    assert sr.count_trivy(err) is None                           # no Results key
+    assert sr.count_osv(err) is None                             # no results key
+    # SARIF missing `version`, or `runs` not a list, is not a SARIF document.
+    assert sr.count_semgrep(json.dumps({"runs": [{"results": []}]})) is None
+    assert sr.count_semgrep(json.dumps({"version": "2.1.0", "runs": "nope"})) is None
+    # A SARIF log from the WRONG tool is rejected on identity.
+    other = json.dumps({"version": "2.1.0",
+                        "runs": [{"tool": {"driver": {"name": "gitleaks"}}, "results": [1]}]})
+    assert sr.count_semgrep(other) is None
+    # Genuine empty scans still count as 0 (NO_FINDINGS), not PARSER_ERROR.
+    assert sr.count_semgrep(json.dumps({"version": "2.1.0", "runs": []})) == 0
+    assert sr.count_trivy(json.dumps({"SchemaVersion": 2, "Results": None})) == 0
+    assert sr.count_osv(json.dumps({"results": []})) == 0
+
+
+def test_run_one_wrong_schema_output_records_parser_error(tmp_path):
+    """A scanner that exits 0 but writes wrong-schema JSON -> PARSER_ERROR record."""
+    out = tmp_path / "raw" / "trivy" / "o__r.json"
+
+    def run_fn(cmd):
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps({"error": "db missing"}), encoding="utf-8")
+        return 0, "", ""
+
+    rec = sr.run_one("trivy", "o/r", "CLR-0001", "sha1", "/scan/repositories/o__r",
+                     out, "/scan/results/raw/trivy/o__r.json", [], "img",
+                     {"limits": {}}, run_fn)
+    assert rec["status"] == "PARSER_ERROR" and rec["finding_count"] is None
+    assert rec["schema_valid"] is False
 
 
 def test_classify_execution():
