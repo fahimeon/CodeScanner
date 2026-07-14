@@ -293,6 +293,33 @@ def test_classify_execution():
     assert sr.classify_execution(0, True, None) == "TIMEOUT"
 
 
+# --- CS-007: batch outcome -> process exit code (findings never fail a run) --- #
+def test_run_exit_policy():
+    policy = {"fail_if_attempted_zero": True, "fail_if_successful_zero": True,
+              "max_scanner_error_rate": 0.02, "max_timeout_rate": 0.05}
+
+    def recs(**counts):
+        out = []
+        for status, k in counts.items():
+            out += [{"status": status.upper()}] * k
+        return out
+
+    # Nothing attempted -> systemic (4).
+    assert sr.run_exit_policy([], policy)[0] == 4
+    # Everything failed -> systemic (4).
+    assert sr.run_exit_policy(recs(scanner_error=5), policy)[0] == 4
+    # A clean run, including findings, is exit 0 (findings never fail a run).
+    assert sr.run_exit_policy(recs(success_with_findings=50, no_findings=50), policy)[0] == 0
+    # One error in 100 = 1% <= 2% threshold -> still 0.
+    assert sr.run_exit_policy(recs(no_findings=99, scanner_error=1), policy)[0] == 0
+    # 5 errors in 100 = 5% > 2% -> degraded (3), not systemic.
+    assert sr.run_exit_policy(recs(no_findings=95, scanner_error=5), policy)[0] == 3
+    # 10 timeouts in 100 = 10% > 5% -> degraded (3).
+    assert sr.run_exit_policy(recs(no_findings=90, timeout=10), policy)[0] == 3
+    # NOT_APPLICABLE counts as a successful conclusion, not a failure.
+    assert sr.run_exit_policy(recs(not_applicable=100), policy)[0] == 0
+
+
 # --- scanner-specific exit-code semantics (audit P0 #2) --------------------- #
 def test_exit_semantics_from_config():
     ok, findings = sr.exit_semantics_for("semgrep")

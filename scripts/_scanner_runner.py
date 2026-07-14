@@ -73,7 +73,7 @@ def build_docker_run_args(scanner: str, repo_container_path: str,
         "--pids-limit", str(limits.get("pids", 512)),
         "--memory", str(limits.get("memory", "4g")),
         "--cpus", str(limits.get("cpus", "2.0")),
-        "--ulimit", f"nofile={limits.get('nofile_soft', 4096)}:{limits.get('nofile_hard', 4096)}",
+        "--ulimit", f"nofile={limits.get('nofile', 4096)}:{limits.get('nofile', 4096)}",
     ]
     for host, cont, mode in mounts:
         args += ["-v", f"{host}:{cont}:{mode}"]
@@ -188,6 +188,38 @@ def exit_semantics_for(scanner: str, scanner_cfg: Optional[dict] = None) -> tupl
         scanner_cfg = common.load_yaml(common.CONFIG_DIR / "scanner-config.yaml")
     sem = (scanner_cfg.get("exit_semantics") or {}).get(scanner, {})
     return set(sem.get("ok", [0])), set(sem.get("findings", []))
+
+
+# Terminal states that mean the scan actually ran to a defensible conclusion.
+SUCCESS_STATES = {"NO_FINDINGS", "SUCCESS_WITH_FINDINGS", "NOT_APPLICABLE", "UNSUPPORTED"}
+# Terminal states that mean the scan did NOT produce usable data.
+FAILURE_STATES = {"SCANNER_ERROR", "PARSER_ERROR", "OUTPUT_MISSING",
+                  "OUTPUT_CORRUPT", "PROVENANCE_MISMATCH", "RESOURCE_LIMIT"}
+
+
+def run_exit_policy(records: list[dict], policy: Optional[dict] = None) -> tuple[int, list]:
+    """Map a batch of execution records to a process exit code (CS-007).
+
+    0=within policy, 3=degraded beyond a rate threshold, 4=systemic (nothing
+    attempted or nothing succeeded). Findings never make the run fail."""
+    policy = policy or {}
+    n = len(records)
+    if n == 0:
+        return (4, ["no_repositories_scanned"]) if policy.get("fail_if_attempted_zero", True) else (0, [])
+    from collections import Counter
+    counts = Counter(r.get("status") for r in records)
+    successes = sum(counts.get(s, 0) for s in SUCCESS_STATES)
+    errors = sum(counts.get(s, 0) for s in FAILURE_STATES)
+    timeouts = counts.get("TIMEOUT", 0)
+    if successes == 0 and policy.get("fail_if_successful_zero", True):
+        return 4, ["all_scans_failed", dict(counts)]
+    reasons: list = []
+    err_rate, to_rate = errors / n, timeouts / n
+    if err_rate > policy.get("max_scanner_error_rate", 0.02):
+        reasons.append(f"scanner_error_rate={err_rate:.3f}>max={policy.get('max_scanner_error_rate', 0.02)}")
+    if to_rate > policy.get("max_timeout_rate", 0.05):
+        reasons.append(f"timeout_rate={to_rate:.3f}>max={policy.get('max_timeout_rate', 0.05)}")
+    return (3, reasons) if reasons else (0, [])
 
 
 def classify_execution(exit_code: int, timed_out: bool, finding_count: Optional[int],
@@ -550,4 +582,11 @@ def cli_main(scanner: str, argv: Optional[list[str]] = None) -> int:
     findings = sum((r["finding_count"] or 0) for r in records)
     print(f"{scanner}: scanned {len(records)} repositories; statuses={dict(statuses)}; "
           f"total findings={findings}")
-    return 0
+
+    # CS-007: a research collection run exits non-zero if it did not actually
+    # collect data (nothing attempted / nothing succeeded / over error thresholds).
+    policy = common.load_yaml(common.CONFIG_DIR / "scanner-config.yaml").get("failure_policy", {})
+    code, reasons = run_exit_policy(records, policy)
+    if code != 0:
+        print(f"RUN FAILURE POLICY: exit {code} ({reasons}).", file=sys.stderr)
+    return code
