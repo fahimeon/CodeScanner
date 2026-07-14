@@ -2,6 +2,7 @@
 and the shared scanner harness (all offline; docker/git behind injected runners)."""
 
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -10,6 +11,19 @@ import prepare_scanners as ps
 import clone_selected_repositories as cl
 import _scanner_runner as sr
 import _common as common
+
+
+def _staging_output_from_cmd(cmd, ext):
+    """The host staging file a container would write, parsed from a run_all docker
+    cmd (CS-014: the scanner's only writable mount is host:/scan/output:rw)."""
+    for i, arg in enumerate(cmd):
+        nxt = str(cmd[i + 1]) if i + 1 < len(cmd) else ""
+        if arg == "-v" and ":/scan/output:" in nxt:
+            host = nxt.split(":/scan/output:")[0]
+            out = Path(host) / f"result.{ext}"
+            out.parent.mkdir(parents=True, exist_ok=True)
+            return out
+    raise AssertionError("no /scan/output writable mount in docker cmd")
 
 
 # =========================================================================== #
@@ -24,6 +38,33 @@ def test_build_scanner_commands():
     assert "/d" in ps.build_osv_download_args("/d")
     smoke = ps.build_smoke_args("gitleaks", "img")
     assert "--network" in smoke and "none" in smoke and "--entrypoint" in smoke
+
+
+def test_incontainer_asset_prep_builders():
+    # Semgrep rules come from the pinned registry ruleset URL.
+    assert ps.semgrep_registry_url("p/javascript") == "https://semgrep.dev/c/p/javascript"
+    # Trivy DB downloaded with the IMAGE's trivy into a rw mount.
+    tv = ps.build_trivy_incontainer_args("img", "/host/tv")
+    assert tv[0] == "run" and "img" in tv and "trivy" in tv
+    assert "--download-db-only" in tv and "/host/tv:/trivycache:rw" in tv
+    assert tv[-2:] == ["--cache-dir", "/trivycache"]
+    # OSV DB downloaded with the IMAGE's osv-scanner 1.9.2 flags.
+    osv = ps.build_osv_incontainer_args("img", "/host/t", "/host/db")
+    assert "--experimental-offline" in osv and "--experimental-download-offline-databases" in osv
+    assert "/host/t:/osvtarget:ro" in osv and "/host/db:/osvdb:rw" in osv
+    assert osv[osv.index("--experimental-local-db-path") + 1] == "/osvdb"
+
+
+def test_fetch_semgrep_rules_writes_each_ruleset(tmp_path):
+    calls = []
+    def fetch_fn(url):
+        calls.append(url)
+        return "" if url.endswith("p/nextjs") else "rules:\n- id: x\n"   # empty pack skipped
+    n = ps.fetch_semgrep_rules(["p/javascript", "p/nextjs", "p/react"], tmp_path, fetch_fn)
+    assert n == 2                                            # empty p/nextjs skipped
+    assert (tmp_path / "p_javascript.yml").read_text(encoding="utf-8").startswith("rules:")
+    assert not (tmp_path / "p_nextjs.yml").exists()
+    assert calls[0] == "https://semgrep.dev/c/p/javascript"
 
 
 def _point_caches(monkeypatch, tmp_path, populate=True):
@@ -70,6 +111,26 @@ def test_prepare_fail_closed_when_rules_or_dbs_missing(tmp_path, monkeypatch):
     assert "semgrep_rules_cache_missing" in marker["problems"]
     assert "trivy_db_missing" in marker["problems"]
     assert "osv_db_missing" in marker["problems"]
+
+
+def test_prepare_fail_closed_when_build_fails_even_if_stale_image_exists(tmp_path, monkeypatch):
+    """CS-015: a failed build must not reuse a stale :latest image and claim ready."""
+    _point_caches(monkeypatch, tmp_path, populate=True)
+
+    def run_fn(cmd):
+        joined = " ".join(str(c) for c in cmd)
+        if cmd[:2] == ["docker", "build"] or "Dockerfile.scanner" in joined:
+            return 1, "", "build error: layer failed"      # BUILD FAILS
+        if "RepoDigests" in joined:                          # a stale image still resolves
+            return 0, "img@sha256:staaale\n", ""
+        if "inspect" in cmd:
+            return 0, "sha256:staleid\n", ""
+        return 0, "v1.0.0\n", ""
+
+    marker = ps.prepare("docker", "semgrep", "trivy", "osv-scanner", run_fn, build=True)
+    assert marker["ready"] is False                          # never ready on failed build
+    assert marker["image_digest"] is None and marker["image_id"] is None  # no stale reuse
+    assert "scanner_image_not_built" in marker["problems"]
 
 
 def test_scanners_ready_state_transitions():
@@ -236,7 +297,7 @@ def test_finding_count_parsers():
     assert sr.count_gitleaks(json.dumps([{"a": 1}, {"b": 2}])) == 2
     assert sr.count_gitleaks(json.dumps([])) == 0
     assert sr.count_gitleaks("not json") is None
-    sarif = json.dumps({"runs": [{"results": [1, 2, 3]}, {"results": [4]}]})
+    sarif = json.dumps({"version": "2.1.0", "runs": [{"results": [1, 2, 3]}, {"results": [4]}]})
     assert sr.count_semgrep(sarif) == 4
     trivy = json.dumps({"Results": [{"Vulnerabilities": [1, 2], "Secrets": [3]},
                                     {"Misconfigurations": [4]}]})
@@ -246,12 +307,77 @@ def test_finding_count_parsers():
     assert sr.count_osv(osv) == 3
 
 
+# --- CS-012: valid JSON with the WRONG schema must be PARSER_ERROR, not zero -- #
+def test_wrong_schema_json_is_parser_error_not_zero():
+    err = json.dumps({"error": "rate limited", "code": 429})     # error-envelope JSON
+    # None (=> PARSER_ERROR) for every scanner; a real empty scan (below) is 0.
+    assert sr.count_gitleaks(err) is None                        # gitleaks report is an array
+    assert sr.count_semgrep(err) is None                         # no version/runs
+    assert sr.count_zizmor(err) is None
+    assert sr.count_trivy(err) is None                           # no Results key
+    assert sr.count_osv(err) is None                             # no results key
+    # SARIF missing `version`, or `runs` not a list, is not a SARIF document.
+    assert sr.count_semgrep(json.dumps({"runs": [{"results": []}]})) is None
+    assert sr.count_semgrep(json.dumps({"version": "2.1.0", "runs": "nope"})) is None
+    # A SARIF log from the WRONG tool is rejected on identity.
+    other = json.dumps({"version": "2.1.0",
+                        "runs": [{"tool": {"driver": {"name": "gitleaks"}}, "results": [1]}]})
+    assert sr.count_semgrep(other) is None
+    # Genuine empty scans still count as 0 (NO_FINDINGS), not PARSER_ERROR.
+    assert sr.count_semgrep(json.dumps({"version": "2.1.0", "runs": []})) == 0
+    assert sr.count_trivy(json.dumps({"SchemaVersion": 2, "Results": None})) == 0
+    assert sr.count_osv(json.dumps({"results": []})) == 0
+
+
+def test_run_one_wrong_schema_output_records_parser_error(tmp_path):
+    """A scanner that exits 0 but writes wrong-schema JSON -> PARSER_ERROR record."""
+    out = tmp_path / "raw" / "trivy" / "o__r.json"
+
+    def run_fn(cmd):
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps({"error": "db missing"}), encoding="utf-8")
+        return 0, "", ""
+
+    rec = sr.run_one("trivy", "o/r", "CLR-0001", "sha1", "/scan/repositories/o__r",
+                     out, "/scan/results/raw/trivy/o__r.json", [], "img",
+                     {"limits": {}}, run_fn)
+    assert rec["status"] == "PARSER_ERROR" and rec["finding_count"] is None
+    assert rec["schema_valid"] is False
+
+
 def test_classify_execution():
     assert sr.classify_execution(0, False, 5) == "SUCCESS_WITH_FINDINGS"
     assert sr.classify_execution(0, False, 0) == "NO_FINDINGS"
     assert sr.classify_execution(0, False, None) == "PARSER_ERROR"
     assert sr.classify_execution(2, False, None) == "SCANNER_ERROR"
     assert sr.classify_execution(0, True, None) == "TIMEOUT"
+
+
+# --- CS-007: batch outcome -> process exit code (findings never fail a run) --- #
+def test_run_exit_policy():
+    policy = {"fail_if_attempted_zero": True, "fail_if_successful_zero": True,
+              "max_scanner_error_rate": 0.02, "max_timeout_rate": 0.05}
+
+    def recs(**counts):
+        out = []
+        for status, k in counts.items():
+            out += [{"status": status.upper()}] * k
+        return out
+
+    # Nothing attempted -> systemic (4).
+    assert sr.run_exit_policy([], policy)[0] == 4
+    # Everything failed -> systemic (4).
+    assert sr.run_exit_policy(recs(scanner_error=5), policy)[0] == 4
+    # A clean run, including findings, is exit 0 (findings never fail a run).
+    assert sr.run_exit_policy(recs(success_with_findings=50, no_findings=50), policy)[0] == 0
+    # One error in 100 = 1% <= 2% threshold -> still 0.
+    assert sr.run_exit_policy(recs(no_findings=99, scanner_error=1), policy)[0] == 0
+    # 5 errors in 100 = 5% > 2% -> degraded (3), not systemic.
+    assert sr.run_exit_policy(recs(no_findings=95, scanner_error=5), policy)[0] == 3
+    # 10 timeouts in 100 = 10% > 5% -> degraded (3).
+    assert sr.run_exit_policy(recs(no_findings=90, timeout=10), policy)[0] == 3
+    # NOT_APPLICABLE counts as a successful conclusion, not a failure.
+    assert sr.run_exit_policy(recs(not_applicable=100), policy)[0] == 0
 
 
 # --- scanner-specific exit-code semantics (audit P0 #2) --------------------- #
@@ -334,6 +460,53 @@ def test_run_one_scanner_error_is_not_zero_findings(tmp_path):
     assert rec["finding_count"] is None       # NOT zeroed on failure
 
 
+# --- CS-003: a scanner timeout must record TIMEOUT and NOT abort the batch --- #
+def test_run_one_timeout_expired_becomes_timeout_record(tmp_path):
+    """A raw subprocess.TimeoutExpired (NOT a subclass of built-in TimeoutError)
+    must still be recorded as TIMEOUT, and the timed-out container force-removed."""
+    killed = []
+
+    def run_fn(cmd):
+        raise subprocess.TimeoutExpired(cmd, 1200)
+
+    rec = sr.run_one("semgrep", "o/r", "CLR-0001", "sha1", "/scan/repositories/o__r",
+                     tmp_path / "out.sarif", "/scan/results/raw/semgrep/o__r.sarif",
+                     [], "img", {"limits": {}}, run_fn,
+                     container_name="cds-semgrep-o__r", kill_fn=killed.append)
+    assert rec["status"] == "TIMEOUT" and rec["timeout_status"] == "TIMEOUT"
+    assert rec["exit_code"] == 124 and rec["finding_count"] is None   # never zeroed
+    assert killed == ["cds-semgrep-o__r"]                             # container cleaned up
+
+
+def test_run_all_continues_to_next_repo_after_timeout(tmp_path, monkeypatch):
+    """The first repository times out; the batch must continue and scan the second."""
+    monkeypatch.setattr(sr, "STUDY_ROOT", tmp_path)
+    for name in ("o__a", "o__b"):
+        (tmp_path / "repositories" / "selected" / name).mkdir(parents=True)
+    raw_dir = tmp_path / "results" / "raw" / "gitleaks"
+    marker = {"pinned_scanner_versions": {"gitleaks": "8.21.2"}, "image_digest": "IMG",
+              "configuration_hash": common.config_bundle_hash()}
+    manifest = [{"repository_full_name": "o/a", "status": "OK",
+                 "anonymous_id": "CLR-0001", "checked_out_sha": "sha1"},
+                {"repository_full_name": "o/b", "status": "OK",
+                 "anonymous_id": "CLR-0002", "checked_out_sha": "sha2"}]
+    killed = []
+
+    def run_fn(cmd):
+        if "o__a" in " ".join(str(c) for c in cmd):
+            raise subprocess.TimeoutExpired(cmd, 1200)     # first repo times out
+        out = _staging_output_from_cmd(cmd, "json")        # container writes to staging
+        out.write_text('[{"RuleID":"x","Secret":"REDACTED"}]', encoding="utf-8")
+        return 0, "", ""
+
+    recs = sr.run_all("gitleaks", manifest, run_fn, ready_marker=marker,
+                      kill_fn=killed.append)
+    by_repo = {r["repository_full_name"]: r for r in recs}
+    assert by_repo["o/a"]["status"] == "TIMEOUT"           # first recorded, not raised
+    assert by_repo["o/b"]["status"] == "SUCCESS_WITH_FINDINGS"   # batch continued
+    assert killed == ["cds-gitleaks-o__a"]
+
+
 # --- P0 #4: run context, complete records, validation, quarantine ----------- #
 def test_build_run_context_from_marker():
     marker = {"pinned_scanner_versions": {"semgrep": "1.97.0", "gitleaks": "8.21.2"},
@@ -388,11 +561,154 @@ def test_validate_existing_output(tmp_path):
     assert ok is False and "output_schema_invalid" in reasons
 
 
+def test_zizmor_not_applicable_without_workflows(tmp_path, monkeypatch):
+    """CS-017: a repo with no .github/workflows -> NOT_APPLICABLE, no container run."""
+    monkeypatch.setattr(sr, "STUDY_ROOT", tmp_path)
+    repo = tmp_path / "repositories" / "selected" / "o__r"
+    repo.mkdir(parents=True)               # NO .github/workflows
+    marker = {"pinned_scanner_versions": {"zizmor": "1.0.0"}, "image_digest": "IMG",
+              "configuration_hash": common.config_bundle_hash()}
+    manifest = [{"repository_full_name": "o/r", "status": "OK",
+                 "anonymous_id": "CLR-0001", "checked_out_sha": "sha1"}]
+
+    def boom(cmd):
+        raise AssertionError("zizmor must not run a container when not applicable")
+
+    recs = sr.run_all("zizmor", manifest, boom, ready_marker=marker)
+    assert recs[0]["status"] == "NOT_APPLICABLE"
+    assert recs[0]["finding_count"] is None and recs[0]["applicable_file_count"] == 0
+    assert recs[0]["error_message"] == "no_github_workflows"
+
+    # With a workflow present, zizmor DOES run.
+    (repo / ".github" / "workflows").mkdir(parents=True)
+    (repo / ".github" / "workflows" / "ci.yml").write_text("on: push", encoding="utf-8")
+
+    def run_fn(cmd):
+        out = _staging_output_from_cmd(cmd, "sarif")
+        out.write_text(json.dumps({"version": "2.1.0", "runs": []}), encoding="utf-8")
+        return 0, "", ""
+
+    recs2 = sr.run_all("zizmor", manifest, run_fn, ready_marker=marker)
+    assert recs2[0]["status"] == "NO_FINDINGS"
+    # Published into the immutable raw namespace, never left in staging.
+    assert (tmp_path / "results" / "raw" / "zizmor" / "o__r.sarif").exists()
+
+
+def test_count_workflow_files(tmp_path):
+    assert sr.count_workflow_files(tmp_path) == 0
+    wf = tmp_path / ".github" / "workflows"
+    wf.mkdir(parents=True)
+    (wf / "ci.yml").write_text("on: push", encoding="utf-8")
+    (wf / "release.yaml").write_text("on: tag", encoding="utf-8")
+    (wf / "notes.md").write_text("ignore me", encoding="utf-8")
+    assert sr.count_workflow_files(tmp_path) == 2
+
+
+def test_execution_record_v2_has_full_provenance(tmp_path, monkeypatch):
+    """CS-011: durable versioned records carry the full toolchain + sample + output provenance."""
+    monkeypatch.setattr(sr, "STUDY_ROOT", tmp_path)
+    (tmp_path / "repositories" / "selected" / "o__r").mkdir(parents=True)
+    marker = {"pinned_scanner_versions": {"gitleaks": "8.21.2"}, "image_digest": "sha256:IMG",
+              "image_id": "sha256:LOCALID", "configuration_hash": common.config_bundle_hash()}
+    manifest = [{"repository_full_name": "o/r", "status": "OK", "anonymous_id": "CLR-0001",
+                 "checked_out_sha": "a" * 40, "expected_commit_sha": "a" * 40}]
+
+    def run_fn(cmd):
+        out = _staging_output_from_cmd(cmd, "json")
+        out.write_text('[{"RuleID":"x","Secret":"REDACTED"}]', encoding="utf-8")
+        return 0, "", ""
+
+    rec = sr.run_all("gitleaks", manifest, run_fn, ready_marker=marker)[0]
+    for field in ("schema_version", "run_id", "scanner_version", "image_digest", "image_id",
+                  "configuration_hash", "ruleset_or_db_hash", "sample_sha256",
+                  "expected_commit_sha", "checked_out_commit_sha", "start_time", "end_time",
+                  "timeout_seconds", "resource_limits", "output_sha256", "output_size_bytes"):
+        assert field in rec, f"missing provenance field {field}"
+    assert rec["schema_version"] == sr.EXEC_RECORD_SCHEMA_VERSION
+    assert rec["image_id"] == "sha256:LOCALID"
+    assert rec["expected_commit_sha"] == "a" * 40 and rec["checked_out_commit_sha"] == "a" * 40
+    assert len(rec["output_sha256"]) == 64 and rec["output_size_bytes"] > 0
+    assert len(rec["sample_sha256"]) == 64 and rec["run_id"]
+    assert set(rec["resource_limits"]) >= {"cpus", "memory", "pids", "nofile"}
+
+
+def test_pilot_and_full_scope_are_isolated(tmp_path, monkeypatch):
+    """CS-010: pilot and full runs write to fully separate raw namespaces + records."""
+    monkeypatch.setattr(sr, "STUDY_ROOT", tmp_path)
+    (tmp_path / "repositories" / "selected" / "o__r").mkdir(parents=True)
+    marker = {"pinned_scanner_versions": {"gitleaks": "8.21.2"}, "image_digest": "IMG",
+              "configuration_hash": common.config_bundle_hash()}
+    manifest = [{"repository_full_name": "o/r", "status": "OK", "anonymous_id": "CLR-0001",
+                 "checked_out_sha": "sha1"}]
+
+    def run_fn(cmd):
+        out = _staging_output_from_cmd(cmd, "json")
+        out.write_text('[{"RuleID":"x","Secret":"REDACTED"}]', encoding="utf-8")
+        return 0, "", ""
+
+    sr.run_all("gitleaks", manifest, run_fn, ready_marker=marker, scope="pilot")
+    sr.run_all("gitleaks", manifest, run_fn, ready_marker=marker, scope="full")
+    pilot_raw = tmp_path / "results" / "raw" / "pilot" / "gitleaks"
+    full_raw = tmp_path / "results" / "raw" / "gitleaks"
+    assert (pilot_raw / "o__r.json").exists() and (pilot_raw / "execution-records.jsonl").exists()
+    assert (full_raw / "o__r.json").exists() and (full_raw / "execution-records.jsonl").exists()
+    assert pilot_raw != full_raw and pilot_raw.resolve() != full_raw.resolve()
+    # A bad scope is rejected outright.
+    with pytest.raises(ValueError):
+        sr.run_all("gitleaks", manifest, run_fn, ready_marker=marker, scope="bogus")
+
+
+def test_scanner_only_writable_mount_is_staging(tmp_path, monkeypatch):
+    """CS-014: exactly ONE writable mount (the per-repo staging dir); all else ro."""
+    monkeypatch.setattr(sr, "STUDY_ROOT", tmp_path)
+    (tmp_path / "repositories" / "selected" / "o__r").mkdir(parents=True)
+    marker = {"pinned_scanner_versions": {"gitleaks": "8.21.2"}, "image_digest": "IMG",
+              "configuration_hash": common.config_bundle_hash()}
+    manifest = [{"repository_full_name": "o/r", "status": "OK",
+                 "anonymous_id": "CLR-0001", "checked_out_sha": "sha1"}]
+    seen = {}
+
+    def run_fn(cmd):
+        seen["cmd"] = list(cmd)
+        out = _staging_output_from_cmd(cmd, "json")
+        out.write_text("[]", encoding="utf-8")
+        return 0, "", ""
+
+    sr.run_all("gitleaks", manifest, run_fn, ready_marker=marker)
+    cmd = seen["cmd"]
+    vmounts = [cmd[i + 1] for i, a in enumerate(cmd) if a == "-v"]
+    rw = [m for m in vmounts if m.endswith(":rw")]
+    assert len(rw) == 1 and ":/scan/output:rw" in rw[0]                    # single rw mount
+    assert all(m.endswith(":ro") for m in vmounts if ":/scan/output:" not in m)  # rest ro
+    # The shared raw-results root is NOT mounted into the container at all.
+    assert not any("/scan/results/raw" in m for m in vmounts)
+
+
+def test_bad_schema_staged_output_is_quarantined_not_published(tmp_path, monkeypatch):
+    """CS-014/CS-004: a wrong-schema staged file is quarantined, never published."""
+    monkeypatch.setattr(sr, "STUDY_ROOT", tmp_path)
+    (tmp_path / "repositories" / "selected" / "o__r").mkdir(parents=True)
+    raw_dir = tmp_path / "results" / "raw" / "trivy"
+    marker = {"pinned_scanner_versions": {"trivy": "0.55.0"}, "image_digest": "IMG",
+              "configuration_hash": common.config_bundle_hash()}
+    manifest = [{"repository_full_name": "o/r", "status": "OK",
+                 "anonymous_id": "CLR-0001", "checked_out_sha": "sha1"}]
+
+    def run_fn(cmd):
+        out = _staging_output_from_cmd(cmd, "json")
+        out.write_text(json.dumps({"error": "db missing"}), encoding="utf-8")  # wrong schema
+        return 0, "", ""
+
+    recs = sr.run_all("trivy", manifest, run_fn, ready_marker=marker)
+    assert recs[0]["status"] == "PARSER_ERROR" and recs[0]["output_file"] is None
+    assert not (raw_dir / "o__r.json").exists()                # NOT published
+    assert list((raw_dir / "quarantine").glob("*/result.json"))  # quarantined instead
+
+
 def test_run_all_records_accumulate_resume_and_quarantine(tmp_path, monkeypatch):
     monkeypatch.setattr(sr, "STUDY_ROOT", tmp_path)
     (tmp_path / "repositories" / "selected" / "o__r").mkdir(parents=True)
     raw_dir = tmp_path / "results" / "raw" / "gitleaks"
-    out_host = raw_dir / "o__r.json"
     marker = {"pinned_scanner_versions": {"gitleaks": "8.21.2"}, "image_digest": "IMG",
               "configuration_hash": common.config_bundle_hash()}
     manifest = [{"repository_full_name": "o/r", "status": "OK",
@@ -401,14 +717,18 @@ def test_run_all_records_accumulate_resume_and_quarantine(tmp_path, monkeypatch)
 
     def run_fn(cmd):
         calls["n"] += 1
-        out_host.parent.mkdir(parents=True, exist_ok=True)
-        out_host.write_text('[{"RuleID":"x","Secret":"REDACTED"}]', encoding="utf-8")
+        out = _staging_output_from_cmd(cmd, "json")        # container writes to staging
+        out.write_text('[{"RuleID":"x","Secret":"REDACTED"}]', encoding="utf-8")
         return 0, "", ""
 
     recs = sr.run_all("gitleaks", manifest, run_fn, ready_marker=marker)
     assert calls["n"] == 1 and recs[0]["finding_count"] == 1
     events = raw_dir / "execution-records.jsonl"
     assert (raw_dir / "o__r.record.json").exists() and events.exists()
+    # CS-014: output was atomically published to the raw namespace, staging cleared.
+    assert (raw_dir / "o__r.json").exists()
+    assert not (tmp_path / "results" / "staging" / "gitleaks" / "o__r" / "result.json").exists()
+    assert recs[0]["output_file"].endswith("o__r.json")
 
     # Resume: a valid sidecar is reused; the scanner is NOT re-run.
     def boom(cmd):

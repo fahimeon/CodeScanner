@@ -109,6 +109,30 @@ def canonical_checksum(records: list[dict]) -> str:
     return common.sha256_hex(blob)
 
 
+def verify_population_integrity(population_path: Path,
+                                checksum_json_path: Path) -> tuple[bool, str]:
+    """CS-009: recompute the population checksum and COMPARE it to the frozen
+    manifest value, instead of only checking that the marker file exists. Returns
+    (ok, detail). ok is False if either file is missing/unreadable or the recomputed
+    SHA-256 differs from the recorded one (i.e. the population was edited post-freeze)."""
+    if not population_path.exists():
+        return False, "population_missing"
+    if not checksum_json_path.exists():
+        return False, "checksum_manifest_missing"
+    try:
+        manifest = common.read_json(checksum_json_path)
+        records = common.read_json(population_path)
+    except Exception as exc:
+        return False, f"unreadable:{type(exc).__name__}"
+    recorded = manifest.get("population_sha256")
+    recomputed = canonical_checksum(records)
+    if not recorded:
+        return False, "no_recorded_hash"
+    if recorded != recomputed:
+        return False, f"checksum_mismatch recorded={recorded[:12]}.. recomputed={recomputed[:12]}.."
+    return True, recomputed
+
+
 def build_checksum_manifest(records: list[dict], seed: int) -> dict:
     from collections import Counter
     deployed = [r for r in records if r["track"] == "deployed"]

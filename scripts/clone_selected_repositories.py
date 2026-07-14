@@ -29,10 +29,12 @@ from typing import Callable, Optional
 try:
     from . import _common as common  # type: ignore
     from . import verify_claude_attribution as vca  # type: ignore
+    from . import freeze_population as fp  # type: ignore
 except Exception:  # pragma: no cover
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import _common as common  # type: ignore
     import verify_claude_attribution as vca  # type: ignore
+    import freeze_population as fp  # type: ignore
 
 STUDY_ROOT = common.STUDY_ROOT
 
@@ -228,7 +230,7 @@ def make_git_clone_fn(git_path: str, clone_root: Path, clone_timeout: int = 300)
 
     def _run(args, timeout):
         import subprocess
-        return subprocess.run([git_path, *args], capture_output=True, text=True,
+        return subprocess.run([git_path, *args], capture_output=True, text=True, encoding="utf-8", errors="replace",
                               timeout=timeout, check=False, env=env)
 
     def _measure(path: Path) -> tuple[int, int, int]:
@@ -289,7 +291,7 @@ def make_git_mirror_clone_fn(git_path: str, history_root: Path, clone_timeout: i
 
     def _run(args, timeout):
         import subprocess
-        return subprocess.run([git_path, *args], capture_output=True, text=True,
+        return subprocess.run([git_path, *args], capture_output=True, text=True, encoding="utf-8", errors="replace",
                               timeout=timeout, check=False, env=env)
 
     def _fn(full: str, url: str, frozen_sha: str, dest: Path) -> dict:
@@ -328,11 +330,21 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     selected_path = processed / "selected-500-repositories.csv"
     frozen = processed / "eligible-population-checksum.txt"
+    population_path = processed / "eligible-population.json"
     if not frozen.exists():
         print("REFUSING TO CLONE: population not frozen. Run 'make freeze' first.", file=sys.stderr)
         return 2
     if not selected_path.exists():
         print("REFUSING TO CLONE: sample not selected. Run 'make select' first.", file=sys.stderr)
+        return 2
+
+    # CS-009: the frozen population must still be VALID (unedited since freeze),
+    # not merely present, before we clone the exact snapshots it pinned.
+    ok, detail = fp.verify_population_integrity(
+        population_path, processed / "eligible-population-checksum.json")
+    if not ok:
+        print(f"REFUSING TO CLONE: frozen population integrity check failed ({detail}). "
+              f"Re-run 'make freeze' then 'make select'.", file=sys.stderr)
         return 2
 
     with selected_path.open(encoding="utf-8") as fh:
@@ -347,15 +359,26 @@ def main(argv: Optional[list[str]] = None) -> int:
     if git is None:
         print("ERROR: git not found on PATH.", file=sys.stderr)
         return 2
-    clone_root = STUDY_ROOT / cfg["paths"]["selected_clone"]
-    history_root = STUDY_ROOT / cfg["paths"].get("history_clone", "repositories/history")
+    # CS-010: pilot clones + manifest live under a separate namespace so a pilot
+    # never overwrites the full clone manifest or shares its repositories/raw scope.
+    if args.pilot:
+        clone_root = STUDY_ROOT / "repositories" / "pilot" / "selected"
+        history_root = STUDY_ROOT / "repositories" / "pilot" / "history"
+        manifest_dir = processed / "pilot"
+        log_name = "clone_selected_pilot.jsonl"
+    else:
+        clone_root = STUDY_ROOT / cfg["paths"]["selected_clone"]
+        history_root = STUDY_ROOT / cfg["paths"].get("history_clone", "repositories/history")
+        manifest_dir = processed
+        log_name = "clone_selected.jsonl"
     clone_fn = make_git_clone_fn(git, clone_root, clone_timeout)
     history_clone_fn = make_git_mirror_clone_fn(git, history_root, clone_timeout)
-    log_path = STUDY_ROOT / cfg["paths"]["logs"] / "clone_selected.jsonl"
+    log_path = STUDY_ROOT / cfg["paths"]["logs"] / log_name
 
     records = clone_all(selected, clone_root, log_path, clone_fn, limits,
                         history_clone_fn=history_clone_fn, history_root=history_root)
-    write_manifest(records, processed / "clone-manifest.json", processed / "clone-manifest.csv")
+    common.ensure_dir(manifest_dir)
+    write_manifest(records, manifest_dir / "clone-manifest.json", manifest_dir / "clone-manifest.csv")
 
     ok = sum(1 for r in records if r["status"] == "OK")
     print(f"Cloned {ok}/{len(records)} selected repositories -> {clone_root}")

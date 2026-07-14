@@ -430,9 +430,10 @@ def gh_is_authenticated(gh_path: str) -> bool:
     try:
         proc = subprocess.run(
             [gh_path, "auth", "status"],
-            capture_output=True, text=True, timeout=30, check=False,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=30, check=False,
         )
-        return proc.returncode == 0 and "Logged in to" in (proc.stdout + proc.stderr)
+        return proc.returncode == 0 and "Logged in to" in ((proc.stdout or "") + (proc.stderr or ""))
     except Exception:
         return False
 
@@ -499,7 +500,10 @@ def make_gh_search_fn(gh_path: str, kind: str, limit: int, language: str = "",
             args = build_repo_search_args(language, start, end, limit, stars)
             parser = parse_repo_search_output
         proc = subprocess.run(
+            # gh always emits UTF-8; decode as UTF-8 explicitly so a non-ASCII byte
+            # in commit/author data cannot crash the reader on a cp1252 (Windows) host.
             [gh_path, *args], capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
             timeout=180, check=False,
         )
         if proc.returncode != 0:

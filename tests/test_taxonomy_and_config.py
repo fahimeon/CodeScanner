@@ -177,6 +177,28 @@ def test_entrypoint_trivy_scanners_match_config():
     )
 
 
+def test_entrypoint_binds_explicit_offline_asset_paths():
+    """CS-002: offline scanners must be pointed at the EXPLICIT mounted asset
+    paths, not their (empty, ephemeral) default caches."""
+    code = "\n".join(
+        ln for ln in ENTRYPOINT.read_text(encoding="utf-8").splitlines()
+        if not ln.strip().startswith("#")
+    )
+    assert "--cache-dir /scan/trivy-cache" in code                  # Trivy DB
+    assert "--experimental-local-db-path /scan/osv-db" in code      # OSV DB
+    assert "--config /scan/semgrep-rules" in code                   # Semgrep rules
+    # osv-scanner 1.9.2 needs --experimental-offline (bare --offline is exit-127);
+    # trivy uses --offline-scan and zizmor uses --offline -- both valid for their tools.
+    raw = ENTRYPOINT.read_text(encoding="utf-8")
+    osv_block = raw.split("osv-scanner)", 1)[1].split(";;", 1)[0]
+    assert "--experimental-offline" in osv_block
+    assert not re.search(r"(?<!-)--offline(?![\w-])", osv_block)   # osv must not use bare --offline
+    # zizmor 1.x has no --output flag: it must redirect stdout to the output path.
+    zizmor_block = raw.split("zizmor)", 1)[1].split(";;", 1)[0]
+    zizmor_code = "\n".join(l for l in zizmor_block.splitlines() if not l.strip().startswith("#"))
+    assert "--output" not in zizmor_code and '> "$OUTPUT_PATH"' in zizmor_code
+
+
 def test_trivy_github_actions_disabled():
     cfg = _load(SCANNER_CFG)
     assert cfg["scanners"]["trivy"]["scan"]["github_actions"] is False, (

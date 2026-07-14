@@ -290,7 +290,7 @@ def make_git_fingerprint_fn(git_path: str, clone_root: Path,
 
     def _run(args, timeout):
         import subprocess
-        return subprocess.run([git_path, *args], capture_output=True, text=True,
+        return subprocess.run([git_path, *args], capture_output=True, text=True, encoding="utf-8", errors="replace",
                               timeout=timeout, check=False, env=env)
 
     def _fn(full_name: str, default_branch: Optional[str], url: str):

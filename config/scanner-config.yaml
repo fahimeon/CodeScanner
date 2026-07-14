@@ -242,6 +242,7 @@ execution_statuses:
   - SUCCESS
   - SUCCESS_WITH_FINDINGS
   - NO_FINDINGS
+  - NOT_APPLICABLE          # scanner does not apply to this repo (e.g. zizmor, no workflows)
   - TIMEOUT
   - UNSUPPORTED
   - PARSER_ERROR
@@ -265,6 +266,19 @@ exit_semantics:
   trivy:       { ok: [0], findings: [] }         # no --exit-code set -> always 0 on success
   osv-scanner: { ok: [0], findings: [1] }        # 1 = vulnerabilities found; 127/128 = error
   zizmor:      { ok: [0], findings: [1, 13, 14] } # nonzero finding/persona codes (v1.x)
+
+# -----------------------------------------------------------------------------
+# Run failure policy (CS-007). A research COLLECTION run must exit non-zero when
+# it did not actually collect data, so Make/CI/operators never treat a failed run
+# as green. Findings NEVER cause a non-zero exit. Exit codes:
+#   0 complete within policy | 2 precondition error | 3 degraded (over threshold)
+#   4 systemic (zero attempted or zero successful).
+# -----------------------------------------------------------------------------
+failure_policy:
+  fail_if_attempted_zero: true
+  fail_if_successful_zero: true
+  max_scanner_error_rate: 0.02
+  max_timeout_rate: 0.05
 
 # -----------------------------------------------------------------------------
 # Pilot before full run

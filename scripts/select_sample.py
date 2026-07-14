@@ -33,9 +33,11 @@ from typing import Optional
 
 try:
     from . import _common as common  # type: ignore
+    from . import freeze_population as fp  # type: ignore
 except Exception:  # pragma: no cover
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import _common as common  # type: ignore
+    import freeze_population as fp  # type: ignore
 
 STUDY_ROOT = common.STUDY_ROOT
 STRATA_KEYS = ("size_bucket", "framework")
@@ -284,6 +286,15 @@ def main(argv: Optional[list[str]] = None) -> int:
     if not frozen.exists() or not population_path.exists():
         print("REFUSING TO SELECT: population not frozen. Run 'make freeze' first.",
               file=sys.stderr)
+        return 2
+
+    # CS-009: verify the frozen checksum is still VALID (population unedited since
+    # freeze), not merely that the marker file exists.
+    ok, detail = fp.verify_population_integrity(
+        population_path, processed / "eligible-population-checksum.json")
+    if not ok:
+        print(f"REFUSING TO SELECT: frozen population integrity check failed ({detail}). "
+              f"Re-run 'make freeze'.", file=sys.stderr)
         return 2
 
     population = common.read_json(population_path)
