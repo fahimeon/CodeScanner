@@ -66,7 +66,10 @@ Thumbs.db
 *.swp
 
 # ---- Logs & temp ----
-logs/*.log
+# CS-013: operational logs record repository_full_name / GitHub URLs. Ignore the
+# WHOLE tree (not just *.log) so identity-bearing *.jsonl run logs can never be
+# committed. Only the .gitkeep placeholder is allow-listed back in below.
+logs/**
 *.tmp
 .empty-hooks/
 
