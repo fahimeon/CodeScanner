@@ -359,15 +359,26 @@ def main(argv: Optional[list[str]] = None) -> int:
     if git is None:
         print("ERROR: git not found on PATH.", file=sys.stderr)
         return 2
-    clone_root = STUDY_ROOT / cfg["paths"]["selected_clone"]
-    history_root = STUDY_ROOT / cfg["paths"].get("history_clone", "repositories/history")
+    # CS-010: pilot clones + manifest live under a separate namespace so a pilot
+    # never overwrites the full clone manifest or shares its repositories/raw scope.
+    if args.pilot:
+        clone_root = STUDY_ROOT / "repositories" / "pilot" / "selected"
+        history_root = STUDY_ROOT / "repositories" / "pilot" / "history"
+        manifest_dir = processed / "pilot"
+        log_name = "clone_selected_pilot.jsonl"
+    else:
+        clone_root = STUDY_ROOT / cfg["paths"]["selected_clone"]
+        history_root = STUDY_ROOT / cfg["paths"].get("history_clone", "repositories/history")
+        manifest_dir = processed
+        log_name = "clone_selected.jsonl"
     clone_fn = make_git_clone_fn(git, clone_root, clone_timeout)
     history_clone_fn = make_git_mirror_clone_fn(git, history_root, clone_timeout)
-    log_path = STUDY_ROOT / cfg["paths"]["logs"] / "clone_selected.jsonl"
+    log_path = STUDY_ROOT / cfg["paths"]["logs"] / log_name
 
     records = clone_all(selected, clone_root, log_path, clone_fn, limits,
                         history_clone_fn=history_clone_fn, history_root=history_root)
-    write_manifest(records, processed / "clone-manifest.json", processed / "clone-manifest.csv")
+    common.ensure_dir(manifest_dir)
+    write_manifest(records, manifest_dir / "clone-manifest.json", manifest_dir / "clone-manifest.csv")
 
     ok = sum(1 for r in records if r["status"] == "OK")
     print(f"Cloned {ok}/{len(records)} selected repositories -> {clone_root}")

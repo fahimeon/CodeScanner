@@ -36,12 +36,17 @@ SCANNER_IMAGE = "claude-study-scanner:latest"
 OUTPUT_EXT = {"gitleaks": "json", "gitleaks-history": "json", "semgrep": "sarif",
               "trivy": "json", "osv-scanner": "json", "zizmor": "sarif"}
 
-EXEC_FIELDS = ["repository_full_name", "anonymous_id", "scanner", "commit_sha",
-               "scanner_version", "ruleset_or_db_hash", "image_digest",
-               "configuration_hash", "status", "exit_code", "start_time", "end_time",
-               "duration_seconds", "timeout_status", "finding_count", "files_analysed",
+# CS-011: versioned, durable execution-record schema. Bump on any field change.
+EXEC_RECORD_SCHEMA_VERSION = "2.0"
+
+EXEC_FIELDS = ["schema_version", "run_id", "repository_full_name", "anonymous_id",
+               "scanner", "commit_sha", "expected_commit_sha", "checked_out_commit_sha",
+               "scanner_version", "ruleset_or_db_hash", "image_digest", "image_id",
+               "configuration_hash", "sample_sha256", "status", "exit_code",
+               "start_time", "end_time", "duration_seconds", "timeout_status",
+               "timeout_seconds", "resource_limits", "finding_count", "files_analysed",
                "applicable_file_count", "schema_valid", "reused", "output_file",
-               "error_message"]
+               "output_sha256", "output_size_bytes", "error_message"]
 
 # Identity fields that MUST match before an existing raw output may be reused.
 IDENTITY_FIELDS = ["repository_full_name", "commit_sha", "scanner", "scanner_version",
@@ -243,7 +248,10 @@ def classify_execution(exit_code: int, timed_out: bool, finding_count: Optional[
 RunFn = Callable[[list], tuple]
 
 
-def build_run_context(scanner: str, ready_marker: Optional[dict]) -> dict:
+def build_run_context(scanner: str, ready_marker: Optional[dict], *,
+                      run_id: Optional[str] = None, sample_sha: Optional[str] = None,
+                      resource_limits: Optional[dict] = None,
+                      timeout_seconds: Optional[int] = None) -> dict:
     """Identity of the CURRENT pinned toolchain (from the SCANNERS_READY marker)
     that every raw output is stamped with and validated against."""
     m = ready_marker or {}
@@ -261,7 +269,15 @@ def build_run_context(scanner: str, ready_marker: Optional[dict]) -> dict:
         "scanner_version": versions.get(version_key),
         "ruleset_or_db_hash": rd_hash,
         "image_digest": m.get("image_digest") or m.get("image_id"),
+        "image_id": m.get("image_id"),
         "configuration_hash": m.get("configuration_hash") or common.config_bundle_hash(),
+        # CS-011 per-run provenance (filled by run_all); rides in ctx so every record
+        # can be tied to the exact toolchain + sample + run without more parameters.
+        "schema_version": EXEC_RECORD_SCHEMA_VERSION,
+        "run_id": run_id,
+        "sample_sha256": sample_sha,
+        "resource_limits": resource_limits or {},
+        "timeout_seconds": timeout_seconds,
     }
 
 
@@ -294,21 +310,31 @@ def count_workflow_files(repo_host: Path) -> int:
 
 def not_applicable_record(scanner: str, repo_full: str, anon_id: Optional[str],
                           commit_sha: Optional[str], ctx: dict, output_host: Path,
-                          reason: str, applicable_file_count: int = 0) -> dict:
+                          reason: str, applicable_file_count: int = 0,
+                          expected_commit_sha: Optional[str] = None) -> dict:
     """A complete NOT_APPLICABLE execution record (no container was run)."""
     now = common.iso_now()
     return {
+        "schema_version": ctx.get("schema_version", EXEC_RECORD_SCHEMA_VERSION),
+        "run_id": ctx.get("run_id"),
         "repository_full_name": repo_full, "anonymous_id": anon_id, "scanner": scanner,
-        "commit_sha": commit_sha, "scanner_version": ctx.get("scanner_version"),
+        "commit_sha": commit_sha,
+        "expected_commit_sha": expected_commit_sha if expected_commit_sha is not None else commit_sha,
+        "checked_out_commit_sha": commit_sha,
+        "scanner_version": ctx.get("scanner_version"),
         "ruleset_or_db_hash": ctx.get("ruleset_or_db_hash"),
-        "image_digest": ctx.get("image_digest"),
+        "image_digest": ctx.get("image_digest"), "image_id": ctx.get("image_id"),
         "configuration_hash": ctx.get("configuration_hash"),
+        "sample_sha256": ctx.get("sample_sha256"),
         "status": "NOT_APPLICABLE", "exit_code": None, "start_time": now, "end_time": now,
-        "duration_seconds": 0.0, "timeout_status": "OK", "finding_count": None,
-        "files_analysed": None, "applicable_file_count": applicable_file_count,
+        "duration_seconds": 0.0, "timeout_status": "OK",
+        "timeout_seconds": ctx.get("timeout_seconds"), "resource_limits": ctx.get("resource_limits") or {},
+        "finding_count": None, "files_analysed": None,
+        "applicable_file_count": applicable_file_count,
         "schema_valid": None, "reused": False,
         "output_file": str(output_host.relative_to(STUDY_ROOT))
                        if _within(output_host, STUDY_ROOT) else str(output_host),
+        "output_sha256": None, "output_size_bytes": None,
         "error_message": reason,
     }
 
@@ -320,7 +346,8 @@ def run_one(scanner: str, repo_full: str, anon_id: Optional[str], commit_sha: Op
             accepted_exit_codes: Optional[set] = None,
             run_context: Optional[dict] = None, *,
             container_name: Optional[str] = None,
-            kill_fn: Optional[Callable[[str], None]] = None) -> dict:
+            kill_fn: Optional[Callable[[str], None]] = None,
+            expected_commit_sha: Optional[str] = None) -> dict:
     """Run one scanner on one repo; the container writes `output_host`. Returns a
     COMPLETE execution record (identity + times + status). A 'findings' exit code
     is a success (output parsed); a genuine failure is never recorded as zero.
@@ -352,29 +379,42 @@ def run_one(scanner: str, repo_full: str, anon_id: Optional[str], commit_sha: Op
 
     finding_count: Optional[int] = None
     files_analysed: Optional[int] = None
+    output_sha256: Optional[str] = None
+    output_size_bytes: Optional[int] = None
     schema_valid = False
     if rc in accepted_exit_codes and not timed_out and output_host.exists():
         text = output_host.read_text(encoding="utf-8", errors="replace")
         finding_count = FINDING_PARSERS[scanner](text)
         schema_valid = finding_count is not None
         files_analysed = _files_analysed(scanner, text)
+        # CS-011: hash + size the exact raw artifact this record refers to.
+        output_sha256 = common.sha256_hex(output_host.read_bytes())
+        output_size_bytes = output_host.stat().st_size
 
     status = classify_execution(rc, timed_out, finding_count, accepted_exit_codes)
     return {
+        "schema_version": ctx.get("schema_version", EXEC_RECORD_SCHEMA_VERSION),
+        "run_id": ctx.get("run_id"),
         "repository_full_name": repo_full,
         "anonymous_id": anon_id,
         "scanner": scanner,
-        "commit_sha": commit_sha,
+        "commit_sha": commit_sha,                       # == checked-out (clone verified)
+        "expected_commit_sha": expected_commit_sha if expected_commit_sha is not None else commit_sha,
+        "checked_out_commit_sha": commit_sha,
         "scanner_version": ctx.get("scanner_version"),
         "ruleset_or_db_hash": ctx.get("ruleset_or_db_hash"),
         "image_digest": ctx.get("image_digest"),
+        "image_id": ctx.get("image_id"),
         "configuration_hash": ctx.get("configuration_hash"),
+        "sample_sha256": ctx.get("sample_sha256"),
         "status": status,
         "exit_code": rc,
         "start_time": start_iso,
         "end_time": end_iso,
         "duration_seconds": duration,
         "timeout_status": "TIMEOUT" if timed_out else "OK",
+        "timeout_seconds": ctx.get("timeout_seconds"),
+        "resource_limits": ctx.get("resource_limits") or {},
         "finding_count": finding_count,
         "files_analysed": files_analysed,
         "applicable_file_count": None,
@@ -382,6 +422,8 @@ def run_one(scanner: str, repo_full: str, anon_id: Optional[str], commit_sha: Op
         "reused": False,
         "output_file": str(output_host.relative_to(STUDY_ROOT))
                        if _within(output_host, STUDY_ROOT) else str(output_host),
+        "output_sha256": output_sha256,
+        "output_size_bytes": output_size_bytes,
         "error_message": (err.strip()[:200] if rc not in accepted_exit_codes and err else None),
     }
 
@@ -455,24 +497,56 @@ def publish_staged_output(staging_file: Path, final_output: Path, rec: dict,
             "repository_full_name": rec.get("repository_full_name"), "ts": common.iso_now()})
 
 
+def new_run_id() -> str:
+    """A unique, sortable per-invocation run id: <UTC compact>-<8 hex>."""
+    import secrets
+    return common.iso_now().replace(":", "").replace("-", "").replace(".", "") + "-" + secrets.token_hex(4)
+
+
+def sample_hash(clone_manifest: list[dict]) -> str:
+    """Deterministic SHA-256 of the OK cohort (repo + frozen SHA pairs) being scanned."""
+    pairs = sorted((r.get("repository_full_name"), r.get("checked_out_sha"))
+                   for r in clone_manifest if r.get("status") == "OK")
+    return common.sha256_hex(json.dumps(pairs, sort_keys=True, ensure_ascii=False))
+
+
 def run_all(scanner: str, clone_manifest: list[dict], run_fn: RunFn, *,
             image: Optional[str] = None, docker: str = "docker",
             ready_marker: Optional[dict] = None, pilot_ids: Optional[set] = None,
             repos_root: Optional[Path] = None,
-            kill_fn: Optional[Callable[[str], None]] = None) -> list[dict]:
+            kill_fn: Optional[Callable[[str], None]] = None,
+            scope: str = "full", run_id: Optional[str] = None) -> list[dict]:
     """Run one scanner over every successfully-cloned repository, with immutable
     append-only records + per-repo sidecars and validated/quarantined reuse.
-    `repos_root` overrides the clone root (e.g. the history mirror for
-    gitleaks-history); results are written under results/raw/<scanner>/."""
+
+    `scope` ('full' | 'pilot') fully ISOLATES the two runs (CS-010): pilot writes
+    its raw outputs, staging, execution records and logs under a `<scope>/` segment
+    so a pilot can never contaminate the full raw-results namespace. `repos_root`
+    overrides the clone root (e.g. the history mirror for gitleaks-history)."""
+    if scope not in ("full", "pilot"):
+        raise ValueError(f"scope must be 'full' or 'pilot', got {scope!r}")
     cfg = common.load_study_config()
     scanner_cfg = common.load_yaml(common.CONFIG_DIR / "scanner-config.yaml")
     isolation = _isolation(scanner_cfg)
-    ctx = build_run_context(scanner, ready_marker)
+    limits = (scanner_cfg.get("isolation", {}) or {}).get("limits", {}) or {}
+    timeout_seconds = int(limits.get("scan_timeout_seconds", 1200))
+    run_id = run_id or new_run_id()
+    ctx = build_run_context(scanner, ready_marker, run_id=run_id,
+                            sample_sha=sample_hash(clone_manifest),
+                            resource_limits={k: limits.get(k) for k in
+                                             ("cpus", "memory", "pids", "nofile")},
+                            timeout_seconds=timeout_seconds)
     image = image or (ctx.get("image_digest") or SCANNER_IMAGE)
     repos_root = repos_root or (STUDY_ROOT / cfg["paths"]["selected_clone"])
-    results_raw = STUDY_ROOT / cfg["paths"]["results_raw"] / scanner
+    scope_seg = "" if scope == "full" else scope       # results/raw[/pilot]/<scanner>
+    raw_base = STUDY_ROOT / cfg["paths"]["results_raw"]
+    results_raw = (raw_base / scope_seg / scanner) if scope_seg else (raw_base / scanner)
+    staging_base = STUDY_ROOT / "results" / "staging"
+    if scope_seg:
+        staging_base = staging_base / scope_seg
     events_path = results_raw / "execution-records.jsonl"       # append-only, never overwritten
-    log_path = STUDY_ROOT / cfg["paths"]["logs"] / f"run_{scanner.replace('-', '_')}.jsonl"
+    log_suffix = f"_{scope}" if scope_seg else ""
+    log_path = STUDY_ROOT / cfg["paths"]["logs"] / f"run_{scanner.replace('-', '_')}{log_suffix}.jsonl"
     ext = OUTPUT_EXT[scanner]
     ok_codes, finding_codes = exit_semantics_for(scanner, scanner_cfg)
     accepted = ok_codes | finding_codes
@@ -491,6 +565,8 @@ def run_all(scanner: str, clone_manifest: list[dict], run_fn: RunFn, *,
         final_output = results_raw / f"{safe}.{ext}"    # immutable published raw output
         sidecar = results_raw / f"{safe}.record.json"
         commit_sha = entry.get("checked_out_sha")
+        expected_sha = (entry.get("expected_commit_sha") or entry.get("frozen_commit_sha")
+                        or commit_sha)
 
         # CS-017: zizmor only applies to repos WITH GitHub Actions workflows. No
         # workflows -> NOT_APPLICABLE (a defensible conclusion), never a scanner
@@ -500,7 +576,8 @@ def run_all(scanner: str, clone_manifest: list[dict], run_fn: RunFn, *,
             if n_wf == 0:
                 rec = not_applicable_record(scanner, full, entry.get("anonymous_id"),
                                             commit_sha, ctx, final_output,
-                                            reason="no_github_workflows")
+                                            reason="no_github_workflows",
+                                            expected_commit_sha=expected_sha)
                 common.atomic_write_json(sidecar, rec)
                 records.append(rec)
                 _append_event(events_path, log_path, rec)
@@ -522,7 +599,7 @@ def run_all(scanner: str, clone_manifest: list[dict], run_fn: RunFn, *,
         # staging directory (mounted rw). Every other mount -- repo, config, rules,
         # DBs -- is read-only, and the shared raw-results root is NOT exposed, so a
         # scanner compromise cannot touch another repo's or scanner's results.
-        staging_dir = STUDY_ROOT / "results" / "staging" / scanner / safe
+        staging_dir = staging_base / scanner / safe
         import shutil
         shutil.rmtree(staging_dir, ignore_errors=True)  # clear stale staging for THIS repo
         staging_file = staging_dir / f"result.{ext}"
@@ -541,7 +618,8 @@ def run_all(scanner: str, clone_manifest: list[dict], run_fn: RunFn, *,
             f"/scan/repositories/{safe}", staging_file,
             f"/scan/output/result.{ext}", mounts, image, isolation,
             run_fn, docker, accepted_exit_codes=accepted, run_context=ctx,
-            container_name=container_name, kill_fn=kill_fn)
+            container_name=container_name, kill_fn=kill_fn,
+            expected_commit_sha=expected_sha)
         # Validate + atomically PUBLISH the staged output into the immutable raw
         # namespace (or quarantine it if it failed validation).
         publish_staged_output(staging_file, final_output, rec, results_raw)
@@ -580,9 +658,13 @@ def cli_main(scanner: str, argv: Optional[list[str]] = None) -> int:
         print(f"REFUSING TO SCAN: frozen sample not found ({selected}).", file=sys.stderr)
         print("Run 'make freeze' then 'make select' first.", file=sys.stderr)
         return 2
-    manifest_path = processed / "clone-manifest.json"
+    # CS-010: a --pilot scan reads the PILOT clone manifest + pilot repositories.
+    manifest_path = (processed / "pilot" / "clone-manifest.json") if args.pilot \
+        else (processed / "clone-manifest.json")
     if not manifest_path.exists():
-        print("ERROR: clone manifest not found. Run 'clone_selected_repositories.py' first.",
+        which = "pilot clone manifest" if args.pilot else "clone manifest"
+        print(f"ERROR: {which} not found ({manifest_path}). "
+              f"Run clone_selected_repositories.py{' --pilot' if args.pilot else ''} first.",
               file=sys.stderr)
         return 2
 
@@ -650,13 +732,19 @@ def cli_main(scanner: str, argv: Optional[list[str]] = None) -> int:
             return 2
 
     # Gitleaks history scans the bare MIRROR clones, not the working tree.
+    # CS-010: pilot scans read the pilot clone roots.
     repos_root = None
-    if scanner == "gitleaks-history":
+    if args.pilot:
+        repos_root = STUDY_ROOT / "repositories" / "pilot" / (
+            "history" if scanner == "gitleaks-history" else "selected")
+    elif scanner == "gitleaks-history":
         repos_root = STUDY_ROOT / cfg["paths"].get("history_clone", "repositories/history")
 
+    # CS-010: pilot and full runs use fully separate result namespaces.
+    scope = "pilot" if args.pilot else "full"
     records = run_all(scanner, clone_manifest, run_fn, docker=docker,
                       ready_marker=marker, pilot_ids=pilot_ids, repos_root=repos_root,
-                      kill_fn=kill_fn)
+                      kill_fn=kill_fn, scope=scope)
 
     from collections import Counter
     statuses = Counter(r["status"] for r in records)

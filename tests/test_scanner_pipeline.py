@@ -577,6 +577,60 @@ def test_count_workflow_files(tmp_path):
     assert sr.count_workflow_files(tmp_path) == 2
 
 
+def test_execution_record_v2_has_full_provenance(tmp_path, monkeypatch):
+    """CS-011: durable versioned records carry the full toolchain + sample + output provenance."""
+    monkeypatch.setattr(sr, "STUDY_ROOT", tmp_path)
+    (tmp_path / "repositories" / "selected" / "o__r").mkdir(parents=True)
+    marker = {"pinned_scanner_versions": {"gitleaks": "8.21.2"}, "image_digest": "sha256:IMG",
+              "image_id": "sha256:LOCALID", "configuration_hash": common.config_bundle_hash()}
+    manifest = [{"repository_full_name": "o/r", "status": "OK", "anonymous_id": "CLR-0001",
+                 "checked_out_sha": "a" * 40, "expected_commit_sha": "a" * 40}]
+
+    def run_fn(cmd):
+        out = _staging_output_from_cmd(cmd, "json")
+        out.write_text('[{"RuleID":"x","Secret":"REDACTED"}]', encoding="utf-8")
+        return 0, "", ""
+
+    rec = sr.run_all("gitleaks", manifest, run_fn, ready_marker=marker)[0]
+    for field in ("schema_version", "run_id", "scanner_version", "image_digest", "image_id",
+                  "configuration_hash", "ruleset_or_db_hash", "sample_sha256",
+                  "expected_commit_sha", "checked_out_commit_sha", "start_time", "end_time",
+                  "timeout_seconds", "resource_limits", "output_sha256", "output_size_bytes"):
+        assert field in rec, f"missing provenance field {field}"
+    assert rec["schema_version"] == sr.EXEC_RECORD_SCHEMA_VERSION
+    assert rec["image_id"] == "sha256:LOCALID"
+    assert rec["expected_commit_sha"] == "a" * 40 and rec["checked_out_commit_sha"] == "a" * 40
+    assert len(rec["output_sha256"]) == 64 and rec["output_size_bytes"] > 0
+    assert len(rec["sample_sha256"]) == 64 and rec["run_id"]
+    assert set(rec["resource_limits"]) >= {"cpus", "memory", "pids", "nofile"}
+
+
+def test_pilot_and_full_scope_are_isolated(tmp_path, monkeypatch):
+    """CS-010: pilot and full runs write to fully separate raw namespaces + records."""
+    monkeypatch.setattr(sr, "STUDY_ROOT", tmp_path)
+    (tmp_path / "repositories" / "selected" / "o__r").mkdir(parents=True)
+    marker = {"pinned_scanner_versions": {"gitleaks": "8.21.2"}, "image_digest": "IMG",
+              "configuration_hash": common.config_bundle_hash()}
+    manifest = [{"repository_full_name": "o/r", "status": "OK", "anonymous_id": "CLR-0001",
+                 "checked_out_sha": "sha1"}]
+
+    def run_fn(cmd):
+        out = _staging_output_from_cmd(cmd, "json")
+        out.write_text('[{"RuleID":"x","Secret":"REDACTED"}]', encoding="utf-8")
+        return 0, "", ""
+
+    sr.run_all("gitleaks", manifest, run_fn, ready_marker=marker, scope="pilot")
+    sr.run_all("gitleaks", manifest, run_fn, ready_marker=marker, scope="full")
+    pilot_raw = tmp_path / "results" / "raw" / "pilot" / "gitleaks"
+    full_raw = tmp_path / "results" / "raw" / "gitleaks"
+    assert (pilot_raw / "o__r.json").exists() and (pilot_raw / "execution-records.jsonl").exists()
+    assert (full_raw / "o__r.json").exists() and (full_raw / "execution-records.jsonl").exists()
+    assert pilot_raw != full_raw and pilot_raw.resolve() != full_raw.resolve()
+    # A bad scope is rejected outright.
+    with pytest.raises(ValueError):
+        sr.run_all("gitleaks", manifest, run_fn, ready_marker=marker, scope="bogus")
+
+
 def test_scanner_only_writable_mount_is_staging(tmp_path, monkeypatch):
     """CS-014: exactly ONE writable mount (the per-repo staging dir); all else ro."""
     monkeypatch.setattr(sr, "STUDY_ROOT", tmp_path)
