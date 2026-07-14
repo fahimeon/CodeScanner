@@ -26,7 +26,7 @@ def test_exit_code_for_collection_gate():
 def test_parse_scanner_pins_reads_dockerfile():
     pins = ce.parse_scanner_pins()   # reads the real docker/Dockerfile.scanner
     assert pins.get("gitleaks") == "8.21.2"
-    assert pins.get("trivy") == "0.58.0"
+    assert pins.get("trivy") == "0.72.0"   # bumped from non-existent 0.58.0
     assert pins.get("semgrep") == "1.97.0"
 
 

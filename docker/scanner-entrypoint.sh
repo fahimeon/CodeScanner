@@ -111,11 +111,13 @@ case "$SCANNER" in
 
   zizmor)
     # Offline audits only (online audits disabled — no token/network in sandbox).
+    # zizmor 1.x has no --output flag: it emits the report to STDOUT, so redirect it
+    # to the mounted output path. Default exit codes are kept (findings -> nonzero)
+    # per scanner-config exit_semantics.
     exec zizmor \
         --format sarif \
         --offline \
-        --output "$OUTPUT_PATH" \
-        "$REPO_PATH/.github/workflows" "$@"
+        "$REPO_PATH/.github/workflows" "$@" > "$OUTPUT_PATH"
     ;;
 
   *)
