@@ -66,6 +66,36 @@ def test_freeze_keeps_only_eligible_and_counts(tmp_path):
     assert len(manifest["population_sha256"]) == 64
 
 
+def test_verify_population_integrity_detects_post_freeze_edit(tmp_path):
+    """CS-009: integrity must recompute+compare the checksum, not just check existence."""
+    records, manifest = fp.freeze(
+        [{"repository_full_name": "o/a"}, {"repository_full_name": "o/b"}],
+        {"o/a": _screen(True), "o/b": _screen(True)},
+        {"o/a": {"track": "deployed", "final_deployment_eligible": True},
+         "o/b": {"track": "deployed", "final_deployment_eligible": True}},
+        {"o/a": {}, "o/b": {}}, {"o/a": {}, "o/b": {}}, {"o/a": {}, "o/b": {}},
+        {"o/a": {}, "o/b": {}}, {}, 20260711)
+    pop = tmp_path / "eligible-population.json"
+    chk = tmp_path / "eligible-population-checksum.txt"
+    fp.write_population(records, pop, tmp_path / "pop.csv")
+    fp.write_checksum(manifest, chk)
+    chk_json = tmp_path / "eligible-population-checksum.json"
+
+    ok, detail = fp.verify_population_integrity(pop, chk_json)
+    assert ok is True and len(detail) == 64                  # recomputed == recorded
+
+    # Tamper with the frozen population after the fact -> integrity must fail.
+    import json
+    edited = json.loads(pop.read_text(encoding="utf-8"))
+    edited[0]["size_bucket"] = "TAMPERED"
+    pop.write_text(json.dumps(edited), encoding="utf-8")
+    ok, detail = fp.verify_population_integrity(pop, chk_json)
+    assert ok is False and "checksum_mismatch" in detail
+
+    # Missing manifest -> not verifiable.
+    assert fp.verify_population_integrity(pop, tmp_path / "nope.json")[0] is False
+
+
 def test_write_population_and_checksum_marker(tmp_path):
     records, manifest = fp.freeze(
         [{"repository_full_name": "o/a"}], {"o/a": _screen(True)},

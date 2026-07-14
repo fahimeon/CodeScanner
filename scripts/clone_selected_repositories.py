@@ -29,10 +29,12 @@ from typing import Callable, Optional
 try:
     from . import _common as common  # type: ignore
     from . import verify_claude_attribution as vca  # type: ignore
+    from . import freeze_population as fp  # type: ignore
 except Exception:  # pragma: no cover
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import _common as common  # type: ignore
     import verify_claude_attribution as vca  # type: ignore
+    import freeze_population as fp  # type: ignore
 
 STUDY_ROOT = common.STUDY_ROOT
 
@@ -328,11 +330,21 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     selected_path = processed / "selected-500-repositories.csv"
     frozen = processed / "eligible-population-checksum.txt"
+    population_path = processed / "eligible-population.json"
     if not frozen.exists():
         print("REFUSING TO CLONE: population not frozen. Run 'make freeze' first.", file=sys.stderr)
         return 2
     if not selected_path.exists():
         print("REFUSING TO CLONE: sample not selected. Run 'make select' first.", file=sys.stderr)
+        return 2
+
+    # CS-009: the frozen population must still be VALID (unedited since freeze),
+    # not merely present, before we clone the exact snapshots it pinned.
+    ok, detail = fp.verify_population_integrity(
+        population_path, processed / "eligible-population-checksum.json")
+    if not ok:
+        print(f"REFUSING TO CLONE: frozen population integrity check failed ({detail}). "
+              f"Re-run 'make freeze' then 'make select'.", file=sys.stderr)
         return 2
 
     with selected_path.open(encoding="utf-8") as fh:
