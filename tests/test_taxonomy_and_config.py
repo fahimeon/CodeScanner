@@ -177,6 +177,18 @@ def test_entrypoint_trivy_scanners_match_config():
     )
 
 
+def test_entrypoint_binds_explicit_offline_asset_paths():
+    """CS-002: offline scanners must be pointed at the EXPLICIT mounted asset
+    paths, not their (empty, ephemeral) default caches."""
+    code = "\n".join(
+        ln for ln in ENTRYPOINT.read_text(encoding="utf-8").splitlines()
+        if not ln.strip().startswith("#")
+    )
+    assert "--cache-dir /scan/trivy-cache" in code                  # Trivy DB
+    assert "--experimental-local-db-path /scan/osv-db" in code      # OSV DB
+    assert "--config /scan/semgrep-rules" in code                   # Semgrep rules
+
+
 def test_trivy_github_actions_disabled():
     cfg = _load(SCANNER_CFG)
     assert cfg["scanners"]["trivy"]["scan"]["github_actions"] is False, (

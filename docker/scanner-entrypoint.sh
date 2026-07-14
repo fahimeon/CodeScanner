@@ -79,11 +79,14 @@ case "$SCANNER" in
 
   trivy)
     # Offline filesystem scan. DB must be pre-fetched into the trivy cache.
+    # CS-002: bind Trivy to the EXPLICIT pinned cache mounted at /scan/trivy-cache
+    # (HOME=/tmp is an ephemeral tmpfs, so the default cache would be empty).
     # The --scanners list below is AUTHORITATIVELY defined in
     # config/scanner-config.yaml (scanners.trivy.scanners) and must match it.
     # License scanning is intentionally NOT enabled (compliance, not security).
     export TRIVY_NO_PROGRESS=true
     exec trivy fs \
+        --cache-dir /scan/trivy-cache \
         --scanners vuln,misconfig,secret \
         --format json \
         --output "$OUTPUT_PATH" \
@@ -94,10 +97,13 @@ case "$SCANNER" in
     ;;
 
   osv-scanner)
-    # Offline dependency scan against pre-fetched OSV database.
+    # Offline dependency scan against the pre-fetched OSV database.
+    # CS-002: point OSV at the EXPLICIT pinned local DB mounted at /scan/osv-db
+    # (matches the --experimental-local-db-path used at prefetch time).
     exec osv-scanner \
         --recursive \
         --offline \
+        --experimental-local-db-path /scan/osv-db \
         --format json \
         --output "$OUTPUT_PATH" \
         "$REPO_PATH" "$@"
