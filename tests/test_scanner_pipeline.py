@@ -40,6 +40,33 @@ def test_build_scanner_commands():
     assert "--network" in smoke and "none" in smoke and "--entrypoint" in smoke
 
 
+def test_incontainer_asset_prep_builders():
+    # Semgrep rules come from the pinned registry ruleset URL.
+    assert ps.semgrep_registry_url("p/javascript") == "https://semgrep.dev/c/p/javascript"
+    # Trivy DB downloaded with the IMAGE's trivy into a rw mount.
+    tv = ps.build_trivy_incontainer_args("img", "/host/tv")
+    assert tv[0] == "run" and "img" in tv and "trivy" in tv
+    assert "--download-db-only" in tv and "/host/tv:/trivycache:rw" in tv
+    assert tv[-2:] == ["--cache-dir", "/trivycache"]
+    # OSV DB downloaded with the IMAGE's osv-scanner 1.9.2 flags.
+    osv = ps.build_osv_incontainer_args("img", "/host/t", "/host/db")
+    assert "--experimental-offline" in osv and "--experimental-download-offline-databases" in osv
+    assert "/host/t:/osvtarget:ro" in osv and "/host/db:/osvdb:rw" in osv
+    assert osv[osv.index("--experimental-local-db-path") + 1] == "/osvdb"
+
+
+def test_fetch_semgrep_rules_writes_each_ruleset(tmp_path):
+    calls = []
+    def fetch_fn(url):
+        calls.append(url)
+        return "" if url.endswith("p/nextjs") else "rules:\n- id: x\n"   # empty pack skipped
+    n = ps.fetch_semgrep_rules(["p/javascript", "p/nextjs", "p/react"], tmp_path, fetch_fn)
+    assert n == 2                                            # empty p/nextjs skipped
+    assert (tmp_path / "p_javascript.yml").read_text(encoding="utf-8").startswith("rules:")
+    assert not (tmp_path / "p_nextjs.yml").exists()
+    assert calls[0] == "https://semgrep.dev/c/p/javascript"
+
+
 def _point_caches(monkeypatch, tmp_path, populate=True):
     for attr, name in [("SEMGREP_CACHE", "sg"), ("TRIVY_CACHE", "tv"), ("OSV_DB_DIR", "osv")]:
         d = tmp_path / name

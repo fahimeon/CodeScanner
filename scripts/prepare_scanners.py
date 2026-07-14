@@ -91,6 +91,102 @@ def build_smoke_args(scanner: str, image: str) -> list[str]:
     return ["run", "--rm", "--network", "none", "--entrypoint", binargs[0], image, *binargs[1:]]
 
 
+# --------------------------------------------------------------------------- #
+# In-container asset prep (host-independent; uses the IMAGE's pinned binaries).
+# The host's trivy/osv/semgrep may be absent or a different version (e.g. host
+# osv 2.x drops the flag image osv 1.9.2 needs, and semgrep has no Windows build).
+# --------------------------------------------------------------------------- #
+def semgrep_registry_url(ruleset: str) -> str:
+    """Registry URL that returns a pinned ruleset as a single combined rule YAML."""
+    return f"https://semgrep.dev/c/{ruleset}"
+
+
+def build_trivy_incontainer_args(image: str, cache_host: str,
+                                 cache_container: str = "/trivycache") -> list[str]:
+    """`docker run` argv: download the Trivy DB with the IMAGE's trivy into a mount."""
+    return ["run", "--rm", "-v", f"{cache_host}:{cache_container}:rw",
+            "--entrypoint", "trivy", image,
+            "fs", "--download-db-only", "--cache-dir", cache_container]
+
+
+def build_osv_incontainer_args(image: str, target_host: str, db_host: str,
+                               target_container: str = "/osvtarget",
+                               db_container: str = "/osvdb") -> list[str]:
+    """`docker run` argv: download the OSV offline DB with the IMAGE's osv-scanner
+    (1.9.2 flags) into a mount. A tiny npm lockfile target drives the npm ecosystem."""
+    return ["run", "--rm",
+            "-v", f"{target_host}:{target_container}:ro",
+            "-v", f"{db_host}:{db_container}:rw",
+            "--entrypoint", "osv-scanner", image,
+            "--experimental-offline", "--experimental-download-offline-databases",
+            "--experimental-local-db-path", db_container, "--recursive", target_container]
+
+
+def fetch_semgrep_rules(rulesets: list, cache_dir: Path, fetch_fn) -> int:
+    """Write each pinned ruleset's registry YAML into cache_dir via injectable
+    fetch_fn(url)->str|bytes. Returns the count written. Skips empty responses."""
+    common.ensure_dir(cache_dir)
+    written = 0
+    for rs in rulesets:
+        body = fetch_fn(semgrep_registry_url(rs))
+        if not body:
+            continue
+        text = body.decode("utf-8", "replace") if isinstance(body, bytes) else body
+        (cache_dir / f"{rs.replace('/', '_')}.yml").write_text(text, encoding="utf-8")
+        written += 1
+    return written
+
+
+def _default_http_fetch(url: str) -> str:
+    import urllib.request
+    with urllib.request.urlopen(url, timeout=60) as resp:  # nosec - fixed semgrep.dev host
+        return resp.read().decode("utf-8", "replace")
+
+
+def run_incontainer_asset_prep(docker: str, image: str, run_fn: RunFn,
+                               fetch_fn=None) -> int:
+    """Populate the pinned offline caches using the IMAGE's binaries + the registry,
+    so preparation does NOT depend on host scanner binaries (which may be absent or a
+    different version). Returns 0 iff Trivy DB + OSV DB + Semgrep rules were produced."""
+    fetch_fn = fetch_fn or _default_http_fetch
+    scanner_cfg = common.load_yaml(common.CONFIG_DIR / "scanner-config.yaml")
+    rulesets = scanner_cfg.get("scanners", {}).get("semgrep", {}).get("rulesets", [])
+    rc = 0
+
+    # Semgrep rules from the registry (semgrep has no Windows build; this is host-agnostic).
+    try:
+        n = fetch_semgrep_rules(rulesets, SEMGREP_CACHE, fetch_fn)
+        if n == 0:
+            rc = 1
+    except Exception as exc:  # pragma: no cover
+        print(f"semgrep rule fetch failed: {exc}", file=sys.stderr)
+        rc = 1
+
+    # Trivy DB via the image's trivy.
+    common.ensure_dir(TRIVY_CACHE)
+    trc, _, terr = run_fn([docker, *build_trivy_incontainer_args(image, str(TRIVY_CACHE))])
+    if trc != 0:
+        print(f"trivy DB download failed: {terr[:200]}", file=sys.stderr)
+        rc = 1
+
+    # OSV DB via the image's osv-scanner (needs a tiny npm lockfile target).
+    common.ensure_dir(OSV_DB_DIR)
+    target = STUDY_ROOT / "config" / "_osv-seed-target"
+    common.ensure_dir(target)
+    (target / "package-lock.json").write_text(
+        '{"name":"seed","version":"1.0.0","lockfileVersion":3,'
+        '"packages":{"":{"dependencies":{"lodash":"4.17.20"}},'
+        '"node_modules/lodash":{"version":"4.17.20"}}}', encoding="utf-8")
+    orc, _, oerr = run_fn([docker, *build_osv_incontainer_args(
+        image, str(target), str(OSV_DB_DIR))])
+    # osv-scanner exits 1 when it FINDS vulns in the seed (expected) -> not an error;
+    # only a missing DB dir is a real failure.
+    if common.hash_dir(OSV_DB_DIR) is None:
+        print(f"osv DB download produced no database: {oerr[:200]}", file=sys.stderr)
+        rc = 1
+    return rc
+
+
 def parse_digest(inspect_stdout: str) -> Optional[str]:
     val = (inspect_stdout or "").strip()
     return val or None
@@ -246,6 +342,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     import shutil
     parser = argparse.ArgumentParser(description="Prepare + pin the scanner toolchain (Phase 19).")
     parser.add_argument("--no-build", action="store_true", help="skip docker build")
+    parser.add_argument("--in-container-assets", action="store_true",
+                        help="prepare Trivy/OSV DBs + Semgrep rules using the IMAGE's "
+                             "pinned binaries + the registry (host-independent)")
     args = parser.parse_args(argv)
 
     docker = shutil.which("docker")
@@ -260,6 +359,11 @@ def main(argv: Optional[list[str]] = None) -> int:
             return proc.returncode, proc.stdout or "", proc.stderr or ""
         except Exception as exc:  # pragma: no cover
             return 1, "", f"{type(exc).__name__}: {exc}"
+
+    if args.in_container_assets:
+        rc = run_incontainer_asset_prep(docker, SCANNER_IMAGE, run_fn)
+        if rc != 0:
+            print(f"  in-container asset prep failed (rc={rc}); see stderr.", file=sys.stderr)
 
     marker = prepare(docker, shutil.which("semgrep"), shutil.which("trivy"),
                      shutil.which("osv-scanner"), run_fn, build=not args.no_build)
