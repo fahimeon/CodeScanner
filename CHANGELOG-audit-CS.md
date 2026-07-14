@@ -30,8 +30,8 @@ Docker end-to-end smoke tests still require a host with Docker).
 | CS-007 | High | **Fixed here** | `scripts/_scanner_runner.py`, `config/scanner-config.yaml` | `test_run_exit_policy` | clone CLI exit policy not yet added (see below) |
 | CS-008 | High | Already fixed (pre-existing) | `scripts/select_sample.py` | distinct-prefix selection tests | global cross-manifest uniqueness assert = follow-up |
 | CS-009 | High | **Fixed here** | `scripts/freeze_population.py`, `select_sample.py`, `clone_selected_repositories.py` | `test_verify_population_integrity_*` | selected-CSV/clone-manifest own checksums = follow-up |
-| CS-010 | High | Partially fixed (pre-existing pilot_ids filter) | `scripts/_scanner_runner.py` | pilot filter tested | full pilot/full **namespace** isolation still a follow-up |
-| CS-011 | High | Mostly fixed (pre-existing provenance) | `scripts/_scanner_runner.py` | complete-record test | missing output_sha256/size, run_id, schema_version |
+| CS-010 | High | **Fixed** (commit `5336973`) | `scripts/_scanner_runner.py`, `clone_selected_repositories.py` | `test_pilot_and_full_scope_are_isolated` | report writers not yet scope-tagged |
+| CS-011 | High | **Fixed** (commit `5336973`) | `scripts/_scanner_runner.py` | `test_execution_record_v2_has_full_provenance` | none known |
 | CS-012 | High | **Fixed here** | `scripts/_scanner_runner.py` | `test_wrong_schema_json_is_parser_error_not_zero`, run_one PARSER_ERROR | none known |
 | CS-013 | High | **Fixed here** | `.gitignore`, `scripts/privacy_lint.py` | `tests/test_privacy_lint.py` (5) | pre-commit hook wiring = follow-up |
 | CS-014 | High | **Fixed here** | `scripts/_scanner_runner.py`, `.gitignore` | single-rw-mount; publish/quarantine tests | Linux non-root UID write-preflight = follow-up |
@@ -44,12 +44,11 @@ Docker end-to-end smoke tests still require a host with Docker).
 ## Not-yet-addressed (audit CS-011 gaps, CS-018, CS-021–026)
 
 These are **not release-blockers** per the audit's own sequencing (Phase 5 / "after the
-blockers"). Tracked, not done in this branch:
+blockers"). Tracked, not done in this branch (**CS-010 and CS-011 are now DONE — commit
+`5336973` — see the gate table**):
 
 - **CS-007 (clone side)** — the clone CLI still returns 0 on partial failure; a
   `min_clone_success_rate` gate mirroring the scanner policy is a follow-up.
-- **CS-010** — separate pilot/full **result namespaces** (`results/raw/pilot/…`).
-- **CS-011** — `ExecutionRecordV2`: output SHA-256/size, run_id, schema_version, host/platform.
 - **CS-018** — env readiness accepting a local image ID (no RepoDigests) for local runs.
 - **CS-021** — Dockerfile supply-chain (digest-pinned base, checksum-verified binaries, no `curl|sh`).
 - **CS-022** — versioned config schema + CI key/cross-field validation.
