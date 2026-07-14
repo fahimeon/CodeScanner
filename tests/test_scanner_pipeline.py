@@ -2,6 +2,7 @@
 and the shared scanner harness (all offline; docker/git behind injected runners)."""
 
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -332,6 +333,54 @@ def test_run_one_scanner_error_is_not_zero_findings(tmp_path):
                      [], "img", {"limits": {}}, run_fn)
     assert rec["status"] == "SCANNER_ERROR"
     assert rec["finding_count"] is None       # NOT zeroed on failure
+
+
+# --- CS-003: a scanner timeout must record TIMEOUT and NOT abort the batch --- #
+def test_run_one_timeout_expired_becomes_timeout_record(tmp_path):
+    """A raw subprocess.TimeoutExpired (NOT a subclass of built-in TimeoutError)
+    must still be recorded as TIMEOUT, and the timed-out container force-removed."""
+    killed = []
+
+    def run_fn(cmd):
+        raise subprocess.TimeoutExpired(cmd, 1200)
+
+    rec = sr.run_one("semgrep", "o/r", "CLR-0001", "sha1", "/scan/repositories/o__r",
+                     tmp_path / "out.sarif", "/scan/results/raw/semgrep/o__r.sarif",
+                     [], "img", {"limits": {}}, run_fn,
+                     container_name="cds-semgrep-o__r", kill_fn=killed.append)
+    assert rec["status"] == "TIMEOUT" and rec["timeout_status"] == "TIMEOUT"
+    assert rec["exit_code"] == 124 and rec["finding_count"] is None   # never zeroed
+    assert killed == ["cds-semgrep-o__r"]                             # container cleaned up
+
+
+def test_run_all_continues_to_next_repo_after_timeout(tmp_path, monkeypatch):
+    """The first repository times out; the batch must continue and scan the second."""
+    monkeypatch.setattr(sr, "STUDY_ROOT", tmp_path)
+    for name in ("o__a", "o__b"):
+        (tmp_path / "repositories" / "selected" / name).mkdir(parents=True)
+    raw_dir = tmp_path / "results" / "raw" / "gitleaks"
+    marker = {"pinned_scanner_versions": {"gitleaks": "8.21.2"}, "image_digest": "IMG",
+              "configuration_hash": common.config_bundle_hash()}
+    manifest = [{"repository_full_name": "o/a", "status": "OK",
+                 "anonymous_id": "CLR-0001", "checked_out_sha": "sha1"},
+                {"repository_full_name": "o/b", "status": "OK",
+                 "anonymous_id": "CLR-0002", "checked_out_sha": "sha2"}]
+    killed = []
+
+    def run_fn(cmd):
+        if "o__a" in " ".join(cmd):
+            raise subprocess.TimeoutExpired(cmd, 1200)     # first repo times out
+        out = raw_dir / "o__b.json"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text('[{"RuleID":"x","Secret":"REDACTED"}]', encoding="utf-8")
+        return 0, "", ""
+
+    recs = sr.run_all("gitleaks", manifest, run_fn, ready_marker=marker,
+                      kill_fn=killed.append)
+    by_repo = {r["repository_full_name"]: r for r in recs}
+    assert by_repo["o/a"]["status"] == "TIMEOUT"           # first recorded, not raised
+    assert by_repo["o/b"]["status"] == "SUCCESS_WITH_FINDINGS"   # batch continued
+    assert killed == ["cds-gitleaks-o__a"]
 
 
 # --- P0 #4: run context, complete records, validation, quarantine ----------- #

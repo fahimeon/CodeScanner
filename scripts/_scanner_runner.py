@@ -15,6 +15,7 @@ building + finding-count parsers are unit-tested offline.
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -51,11 +52,18 @@ IDENTITY_FIELDS = ["repository_full_name", "commit_sha", "scanner", "scanner_ver
 # =========================================================================== #
 def build_docker_run_args(scanner: str, repo_container_path: str,
                           output_container_path: str, mounts: list[tuple],
-                          image: str, isolation: dict) -> list[str]:
-    """`docker run` argv (excluding the docker executable) for one isolated scan."""
+                          image: str, isolation: dict, *,
+                          container_name: Optional[str] = None) -> list[str]:
+    """`docker run` argv (excluding the docker executable) for one isolated scan.
+
+    A `container_name` (recommended) lets the caller force-remove the container if
+    the scan times out (CS-003). The file-descriptor ceiling is enforced with
+    --ulimit nofile so the declared limit is real, not just compose config (CS-020)."""
     limits = isolation.get("limits", {})
-    args = [
-        "run", "--rm",
+    args = ["run", "--rm"]
+    if container_name:
+        args += ["--name", container_name]
+    args += [
         "--user", str(isolation.get("user_uid", "10001:10001")),
         "--network", "none",
         "--read-only",
@@ -65,6 +73,7 @@ def build_docker_run_args(scanner: str, repo_container_path: str,
         "--pids-limit", str(limits.get("pids", 512)),
         "--memory", str(limits.get("memory", "4g")),
         "--cpus", str(limits.get("cpus", "2.0")),
+        "--ulimit", f"nofile={limits.get('nofile_soft', 4096)}:{limits.get('nofile_hard', 4096)}",
     ]
     for host, cont, mode in mounts:
         args += ["-v", f"{host}:{cont}:{mode}"]
@@ -207,23 +216,35 @@ def run_one(scanner: str, repo_full: str, anon_id: Optional[str], commit_sha: Op
             mounts: list[tuple], image: str, isolation: dict,
             run_fn: RunFn, docker: str = "docker",
             accepted_exit_codes: Optional[set] = None,
-            run_context: Optional[dict] = None) -> dict:
+            run_context: Optional[dict] = None, *,
+            container_name: Optional[str] = None,
+            kill_fn: Optional[Callable[[str], None]] = None) -> dict:
     """Run one scanner on one repo; the container writes `output_host`. Returns a
     COMPLETE execution record (identity + times + status). A 'findings' exit code
-    is a success (output parsed); a genuine failure is never recorded as zero."""
+    is a success (output parsed); a genuine failure is never recorded as zero.
+
+    A timeout (either the injected run_fn raising TimeoutError OR a raw
+    subprocess.TimeoutExpired leaking through) becomes a TIMEOUT record so the
+    batch CONTINUES to the next repository instead of aborting (CS-003). When a
+    container_name and kill_fn are given, the timed-out container is force-removed."""
     if accepted_exit_codes is None:
         ok, findings = exit_semantics_for(scanner)
         accepted_exit_codes = ok | findings
     ctx = run_context or {}
     argv = build_docker_run_args(scanner, repo_container_path, output_container_path,
-                                 mounts, image, isolation)
+                                 mounts, image, isolation, container_name=container_name)
     common.ensure_dir(output_host.parent)
     start_iso, start = common.iso_now(), time.monotonic()
     timed_out = False
     try:
         rc, _out, err = run_fn([docker, *argv])
-    except TimeoutError:
+    except (TimeoutError, subprocess.TimeoutExpired):
         rc, err, timed_out = 124, "timeout", True
+        if container_name and kill_fn is not None:
+            try:
+                kill_fn(container_name)          # best-effort: docker rm -f
+            except Exception:                    # pragma: no cover - cleanup must never mask TIMEOUT
+                pass
     duration = round(time.monotonic() - start, 2)
     end_iso = common.iso_now()
 
@@ -311,7 +332,8 @@ def _quarantine(output_host: Path, sidecar: Path, results_raw: Path, reasons: li
 def run_all(scanner: str, clone_manifest: list[dict], run_fn: RunFn, *,
             image: Optional[str] = None, docker: str = "docker",
             ready_marker: Optional[dict] = None, pilot_ids: Optional[set] = None,
-            repos_root: Optional[Path] = None) -> list[dict]:
+            repos_root: Optional[Path] = None,
+            kill_fn: Optional[Callable[[str], None]] = None) -> list[dict]:
     """Run one scanner over every successfully-cloned repository, with immutable
     append-only records + per-repo sidecars and validated/quarantined reuse.
     `repos_root` overrides the clone root (e.g. the history mirror for
@@ -364,11 +386,13 @@ def run_all(scanner: str, clone_manifest: list[dict], run_fn: RunFn, *,
             (str(STUDY_ROOT / "config" / "trivy-cache"), "/scan/trivy-cache", "ro"),
             (str(STUDY_ROOT / "config" / "osv-db"), "/scan/osv-db", "ro"),
         ]
+        container_name = f"cds-{scanner}-{safe}"[:120]
         rec = run_one(
             scanner, full, entry.get("anonymous_id"), commit_sha,
             f"/scan/repositories/{safe}", output_host,
             f"/scan/results/raw/{scanner}/{safe}.{ext}", mounts, image, isolation,
-            run_fn, docker, accepted_exit_codes=accepted, run_context=ctx)
+            run_fn, docker, accepted_exit_codes=accepted, run_context=ctx,
+            container_name=container_name, kill_fn=kill_fn)
         common.atomic_write_json(sidecar, rec)          # one record per repo x scanner
         records.append(rec)
         _append_event(events_path, log_path, rec)
@@ -430,11 +454,22 @@ def cli_main(scanner: str, argv: Optional[list[str]] = None) -> int:
         return 2
 
     def run_fn(cmd: list) -> tuple:
-        import subprocess
         iso = common.load_yaml(common.CONFIG_DIR / "scanner-config.yaml").get("isolation", {})
         timeout = int(iso.get("limits", {}).get("scan_timeout_seconds", 1200))
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
+        except subprocess.TimeoutExpired as exc:
+            # Surface as the built-in TimeoutError run_one records as TIMEOUT (CS-003);
+            # never let TimeoutExpired abort the whole batch.
+            raise TimeoutError(str(exc)) from exc
         return proc.returncode, proc.stdout or "", proc.stderr or ""
+
+    def kill_fn(name: str) -> None:
+        # Best-effort cleanup of a timed-out container; short, bounded, non-fatal.
+        try:
+            subprocess.run([docker, "rm", "-f", name], capture_output=True, timeout=30, check=False)
+        except Exception:                       # pragma: no cover
+            pass
 
     clone_manifest = common.read_json(manifest_path)
     pilot_ids = None
@@ -468,7 +503,8 @@ def cli_main(scanner: str, argv: Optional[list[str]] = None) -> int:
         repos_root = STUDY_ROOT / cfg["paths"].get("history_clone", "repositories/history")
 
     records = run_all(scanner, clone_manifest, run_fn, docker=docker,
-                      ready_marker=marker, pilot_ids=pilot_ids, repos_root=repos_root)
+                      ready_marker=marker, pilot_ids=pilot_ids, repos_root=repos_root,
+                      kill_fn=kill_fn)
 
     from collections import Counter
     statuses = Counter(r["status"] for r in records)
