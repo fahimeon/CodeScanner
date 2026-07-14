@@ -73,6 +73,26 @@ def test_prepare_fail_closed_when_rules_or_dbs_missing(tmp_path, monkeypatch):
     assert "osv_db_missing" in marker["problems"]
 
 
+def test_prepare_fail_closed_when_build_fails_even_if_stale_image_exists(tmp_path, monkeypatch):
+    """CS-015: a failed build must not reuse a stale :latest image and claim ready."""
+    _point_caches(monkeypatch, tmp_path, populate=True)
+
+    def run_fn(cmd):
+        joined = " ".join(str(c) for c in cmd)
+        if cmd[:2] == ["docker", "build"] or "Dockerfile.scanner" in joined:
+            return 1, "", "build error: layer failed"      # BUILD FAILS
+        if "RepoDigests" in joined:                          # a stale image still resolves
+            return 0, "img@sha256:staaale\n", ""
+        if "inspect" in cmd:
+            return 0, "sha256:staleid\n", ""
+        return 0, "v1.0.0\n", ""
+
+    marker = ps.prepare("docker", "semgrep", "trivy", "osv-scanner", run_fn, build=True)
+    assert marker["ready"] is False                          # never ready on failed build
+    assert marker["image_digest"] is None and marker["image_id"] is None  # no stale reuse
+    assert "scanner_image_not_built" in marker["problems"]
+
+
 def test_scanners_ready_state_transitions():
     m = {"ready": True, "configuration_hash": "CFG", "image_digest": "IMG"}
     assert ps.scanners_ready_state(m, "CFG", "IMG")[0] == "READY"

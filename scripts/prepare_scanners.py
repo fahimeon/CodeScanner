@@ -180,13 +180,21 @@ def prepare(docker: str, semgrep: Optional[str], trivy: Optional[str],
                       "optional": optional, "error": (err.strip()[:200] if rc != 0 and err else None)})
         return rc, out, err
 
+    # CS-015: a FAILED build must never fall back to a stale image that happens to
+    # still carry the :latest tag. If the build ran and returned non-zero, refuse to
+    # inspect/accept any pre-existing image -- preparation is not ready.
+    build_ok = True
     if build:
-        step("build_scanner_image", docker,
-             build_image_args("docker/Dockerfile.scanner", SCANNER_IMAGE))
-    rc, out, _ = step("inspect_image_digest", docker, inspect_digest_args(SCANNER_IMAGE), optional=True)
-    image_digest = parse_digest(out) if rc == 0 else None
-    rc2, out2, _ = step("inspect_image_id", docker, inspect_id_args(SCANNER_IMAGE), optional=True)
-    image_id = parse_digest(out2) if rc2 == 0 else None
+        brc, _, _ = step("build_scanner_image", docker,
+                         build_image_args("docker/Dockerfile.scanner", SCANNER_IMAGE))
+        build_ok = (brc == 0)
+    if not build_ok:
+        image_digest = image_id = None
+    else:
+        rc, out, _ = step("inspect_image_digest", docker, inspect_digest_args(SCANNER_IMAGE), optional=True)
+        image_digest = parse_digest(out) if rc == 0 else None
+        rc2, out2, _ = step("inspect_image_id", docker, inspect_id_args(SCANNER_IMAGE), optional=True)
+        image_id = parse_digest(out2) if rc2 == 0 else None
 
     # --- Semgrep rule export + pin + hash ---
     scanner_cfg = common.load_yaml(common.CONFIG_DIR / "scanner-config.yaml")
