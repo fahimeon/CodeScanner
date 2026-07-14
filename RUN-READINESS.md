@@ -11,7 +11,9 @@ item was executed; every "blocked" item names the precise first blocking step.
 |------|----------|
 | All blockers CS-001…CS-017 + CS-020, CS-010, CS-011 | 289 offline tests pass; PR #3; `PRE-SCAN-GATE-TABLE.md` |
 | Systemic Windows UTF-8 crash in gh/git subprocess | Fixed in 9 scripts; `collect_candidates.py --probe` now returns **1000 real records** (was crashing) |
-| Scanner Docker image builds | `docker/Dockerfile.scanner` fixed: Trivy pin `0.58.0`→`0.72.0` (0.58.0 never existed) and `curl\|sh`→pinned tarball (partial CS-021) |
+| Scanner Docker image builds | `docker/Dockerfile.scanner` fixed: Trivy pin `0.58.0`→`0.72.0` (0.58.0 never existed) and `curl\|sh`→pinned tarball (partial CS-021). Image id `dd4f2f568df0`, 732 MB |
+| Phase 1 network-disabled smoke (all 5) | `docker run --network none --entrypoint <bin> … --version` → gitleaks 8.21.2, semgrep 1.97.0, trivy 0.72.0, osv-scanner 1.9.2, zizmor 1.0.1 |
+| **Real end-to-end micro-scan on live infra** | Cloned `4bakker/queue_sim` @ frozen `dec5963…` (HEAD==expected verified); ran gitleaks + zizmor through the real `run_all` (isolated container, network none). gitleaks → `NO_FINDINGS`, published `results/raw/pilot/gitleaks/…json` + ExecutionRecordV2 (schema 2.0, run_id, output_sha256, resource_limits) + append-only ledger; staging atomically cleared. zizmor → `NOT_APPLICABLE` (no workflows). Validates CS-003/005/010/011/014/017 on real infrastructure. |
 
 ## Discovery is live and the population is large
 
