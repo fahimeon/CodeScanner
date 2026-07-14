@@ -97,7 +97,7 @@ def _run(cmd: list[str]) -> tuple[int, str, str]:
         proc = subprocess.run(
             cmd,
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             timeout=SUBPROCESS_TIMEOUT,
             check=False,
             shell=False,

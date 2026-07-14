@@ -390,7 +390,7 @@ def gh_is_authenticated(gh_path: str) -> bool:
     try:
         proc = subprocess.run(
             [gh_path, "auth", "status"],
-            capture_output=True, text=True, timeout=30, check=False,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30, check=False,
         )
         return proc.returncode == 0 and "Logged in to" in (proc.stdout + proc.stderr)
     except Exception:
@@ -418,7 +418,7 @@ def make_gh_metadata_fn(gh_path: str) -> FetchFn:
 
     def _api(args: list[str]) -> subprocess.CompletedProcess:
         _pace()
-        return subprocess.run([gh_path, *args], capture_output=True, text=True,
+        return subprocess.run([gh_path, *args], capture_output=True, text=True, encoding="utf-8", errors="replace",
                               timeout=60, check=False)
 
     @retry_deco

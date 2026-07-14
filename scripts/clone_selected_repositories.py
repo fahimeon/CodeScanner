@@ -230,7 +230,7 @@ def make_git_clone_fn(git_path: str, clone_root: Path, clone_timeout: int = 300)
 
     def _run(args, timeout):
         import subprocess
-        return subprocess.run([git_path, *args], capture_output=True, text=True,
+        return subprocess.run([git_path, *args], capture_output=True, text=True, encoding="utf-8", errors="replace",
                               timeout=timeout, check=False, env=env)
 
     def _measure(path: Path) -> tuple[int, int, int]:
@@ -291,7 +291,7 @@ def make_git_mirror_clone_fn(git_path: str, history_root: Path, clone_timeout: i
 
     def _run(args, timeout):
         import subprocess
-        return subprocess.run([git_path, *args], capture_output=True, text=True,
+        return subprocess.run([git_path, *args], capture_output=True, text=True, encoding="utf-8", errors="replace",
                               timeout=timeout, check=False, env=env)
 
     def _fn(full: str, url: str, frozen_sha: str, dest: Path) -> dict:
