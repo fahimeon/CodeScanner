@@ -7,7 +7,7 @@
 FROM python:3.11-slim-bookworm
 
 ARG GITLEAKS_VERSION=8.21.2
-ARG TRIVY_VERSION=0.58.0
+ARG TRIVY_VERSION=0.72.0
 ARG OSV_SCANNER_VERSION=1.9.2
 ARG SEMGREP_VERSION=1.97.0
 ARG ZIZMOR_VERSION=1.0.1
@@ -28,8 +28,13 @@ RUN curl -fsSL -o /tmp/gitleaks.tar.gz \
     && rm /tmp/gitleaks.tar.gz && chmod +x /usr/local/bin/gitleaks
 
 # --- trivy ---
-RUN curl -fsSL "https://raw.githubusercontent.com/aquasecurity/trivy/v${TRIVY_VERSION}/contrib/install.sh" \
-      | sh -s -- -b /usr/local/bin "v${TRIVY_VERSION}"
+# Direct pinned tarball (NOT `curl | sh`): reproducible and avoids the fragile
+# upstream installer (partial CS-021). amd64 -> "Linux-64bit", arm64 -> "Linux-ARM64".
+RUN TRIVY_ARCH="$(case "${TARGETARCH}" in amd64) echo 64bit;; arm64) echo ARM64;; *) echo 64bit;; esac)" \
+    && curl -fsSL -o /tmp/trivy.tar.gz \
+      "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-${TRIVY_ARCH}.tar.gz" \
+    && tar -xzf /tmp/trivy.tar.gz -C /usr/local/bin trivy \
+    && rm /tmp/trivy.tar.gz && chmod +x /usr/local/bin/trivy
 
 # --- osv-scanner ---
 RUN curl -fsSL -o /usr/local/bin/osv-scanner \
