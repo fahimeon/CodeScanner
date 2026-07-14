@@ -102,7 +102,7 @@ case "$SCANNER" in
     # (matches the --experimental-local-db-path used at prefetch time).
     exec osv-scanner \
         --recursive \
-        --offline \
+        --experimental-offline \
         --experimental-local-db-path /scan/osv-db \
         --format json \
         --output "$OUTPUT_PATH" \
