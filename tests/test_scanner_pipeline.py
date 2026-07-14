@@ -13,6 +13,19 @@ import _scanner_runner as sr
 import _common as common
 
 
+def _staging_output_from_cmd(cmd, ext):
+    """The host staging file a container would write, parsed from a run_all docker
+    cmd (CS-014: the scanner's only writable mount is host:/scan/output:rw)."""
+    for i, arg in enumerate(cmd):
+        nxt = str(cmd[i + 1]) if i + 1 < len(cmd) else ""
+        if arg == "-v" and ":/scan/output:" in nxt:
+            host = nxt.split(":/scan/output:")[0]
+            out = Path(host) / f"result.{ext}"
+            out.parent.mkdir(parents=True, exist_ok=True)
+            return out
+    raise AssertionError("no /scan/output writable mount in docker cmd")
+
+
 # =========================================================================== #
 # prepare_scanners
 # =========================================================================== #
@@ -453,10 +466,9 @@ def test_run_all_continues_to_next_repo_after_timeout(tmp_path, monkeypatch):
     killed = []
 
     def run_fn(cmd):
-        if "o__a" in " ".join(cmd):
+        if "o__a" in " ".join(str(c) for c in cmd):
             raise subprocess.TimeoutExpired(cmd, 1200)     # first repo times out
-        out = raw_dir / "o__b.json"
-        out.parent.mkdir(parents=True, exist_ok=True)
+        out = _staging_output_from_cmd(cmd, "json")        # container writes to staging
         out.write_text('[{"RuleID":"x","Secret":"REDACTED"}]', encoding="utf-8")
         return 0, "", ""
 
@@ -543,15 +555,16 @@ def test_zizmor_not_applicable_without_workflows(tmp_path, monkeypatch):
     # With a workflow present, zizmor DOES run.
     (repo / ".github" / "workflows").mkdir(parents=True)
     (repo / ".github" / "workflows" / "ci.yml").write_text("on: push", encoding="utf-8")
-    raw = tmp_path / "results" / "raw" / "zizmor" / "o__r.sarif"
 
     def run_fn(cmd):
-        raw.parent.mkdir(parents=True, exist_ok=True)
-        raw.write_text(json.dumps({"version": "2.1.0", "runs": []}), encoding="utf-8")
+        out = _staging_output_from_cmd(cmd, "sarif")
+        out.write_text(json.dumps({"version": "2.1.0", "runs": []}), encoding="utf-8")
         return 0, "", ""
 
     recs2 = sr.run_all("zizmor", manifest, run_fn, ready_marker=marker)
     assert recs2[0]["status"] == "NO_FINDINGS"
+    # Published into the immutable raw namespace, never left in staging.
+    assert (tmp_path / "results" / "raw" / "zizmor" / "o__r.sarif").exists()
 
 
 def test_count_workflow_files(tmp_path):
@@ -564,11 +577,57 @@ def test_count_workflow_files(tmp_path):
     assert sr.count_workflow_files(tmp_path) == 2
 
 
+def test_scanner_only_writable_mount_is_staging(tmp_path, monkeypatch):
+    """CS-014: exactly ONE writable mount (the per-repo staging dir); all else ro."""
+    monkeypatch.setattr(sr, "STUDY_ROOT", tmp_path)
+    (tmp_path / "repositories" / "selected" / "o__r").mkdir(parents=True)
+    marker = {"pinned_scanner_versions": {"gitleaks": "8.21.2"}, "image_digest": "IMG",
+              "configuration_hash": common.config_bundle_hash()}
+    manifest = [{"repository_full_name": "o/r", "status": "OK",
+                 "anonymous_id": "CLR-0001", "checked_out_sha": "sha1"}]
+    seen = {}
+
+    def run_fn(cmd):
+        seen["cmd"] = list(cmd)
+        out = _staging_output_from_cmd(cmd, "json")
+        out.write_text("[]", encoding="utf-8")
+        return 0, "", ""
+
+    sr.run_all("gitleaks", manifest, run_fn, ready_marker=marker)
+    cmd = seen["cmd"]
+    vmounts = [cmd[i + 1] for i, a in enumerate(cmd) if a == "-v"]
+    rw = [m for m in vmounts if m.endswith(":rw")]
+    assert len(rw) == 1 and ":/scan/output:rw" in rw[0]                    # single rw mount
+    assert all(m.endswith(":ro") for m in vmounts if ":/scan/output:" not in m)  # rest ro
+    # The shared raw-results root is NOT mounted into the container at all.
+    assert not any("/scan/results/raw" in m for m in vmounts)
+
+
+def test_bad_schema_staged_output_is_quarantined_not_published(tmp_path, monkeypatch):
+    """CS-014/CS-004: a wrong-schema staged file is quarantined, never published."""
+    monkeypatch.setattr(sr, "STUDY_ROOT", tmp_path)
+    (tmp_path / "repositories" / "selected" / "o__r").mkdir(parents=True)
+    raw_dir = tmp_path / "results" / "raw" / "trivy"
+    marker = {"pinned_scanner_versions": {"trivy": "0.55.0"}, "image_digest": "IMG",
+              "configuration_hash": common.config_bundle_hash()}
+    manifest = [{"repository_full_name": "o/r", "status": "OK",
+                 "anonymous_id": "CLR-0001", "checked_out_sha": "sha1"}]
+
+    def run_fn(cmd):
+        out = _staging_output_from_cmd(cmd, "json")
+        out.write_text(json.dumps({"error": "db missing"}), encoding="utf-8")  # wrong schema
+        return 0, "", ""
+
+    recs = sr.run_all("trivy", manifest, run_fn, ready_marker=marker)
+    assert recs[0]["status"] == "PARSER_ERROR" and recs[0]["output_file"] is None
+    assert not (raw_dir / "o__r.json").exists()                # NOT published
+    assert list((raw_dir / "quarantine").glob("*/result.json"))  # quarantined instead
+
+
 def test_run_all_records_accumulate_resume_and_quarantine(tmp_path, monkeypatch):
     monkeypatch.setattr(sr, "STUDY_ROOT", tmp_path)
     (tmp_path / "repositories" / "selected" / "o__r").mkdir(parents=True)
     raw_dir = tmp_path / "results" / "raw" / "gitleaks"
-    out_host = raw_dir / "o__r.json"
     marker = {"pinned_scanner_versions": {"gitleaks": "8.21.2"}, "image_digest": "IMG",
               "configuration_hash": common.config_bundle_hash()}
     manifest = [{"repository_full_name": "o/r", "status": "OK",
@@ -577,14 +636,18 @@ def test_run_all_records_accumulate_resume_and_quarantine(tmp_path, monkeypatch)
 
     def run_fn(cmd):
         calls["n"] += 1
-        out_host.parent.mkdir(parents=True, exist_ok=True)
-        out_host.write_text('[{"RuleID":"x","Secret":"REDACTED"}]', encoding="utf-8")
+        out = _staging_output_from_cmd(cmd, "json")        # container writes to staging
+        out.write_text('[{"RuleID":"x","Secret":"REDACTED"}]', encoding="utf-8")
         return 0, "", ""
 
     recs = sr.run_all("gitleaks", manifest, run_fn, ready_marker=marker)
     assert calls["n"] == 1 and recs[0]["finding_count"] == 1
     events = raw_dir / "execution-records.jsonl"
     assert (raw_dir / "o__r.record.json").exists() and events.exists()
+    # CS-014: output was atomically published to the raw namespace, staging cleared.
+    assert (raw_dir / "o__r.json").exists()
+    assert not (tmp_path / "results" / "staging" / "gitleaks" / "o__r" / "result.json").exists()
+    assert recs[0]["output_file"].endswith("o__r.json")
 
     # Resume: a valid sidecar is reused; the scanner is NOT re-run.
     def boom(cmd):

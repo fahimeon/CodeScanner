@@ -8,6 +8,8 @@
 data/private/
 repositories/
 results/raw/
+results/staging/                     # CS-014: transient per-scan staging (never committed)
+results/quarantine/                  # quarantined invalid raw outputs
 results/reports/private-repositories/
 
 # Redacted and normalized results are also excluded by default; publish only

@@ -432,6 +432,29 @@ def _quarantine(output_host: Path, sidecar: Path, results_raw: Path, reasons: li
     common.atomic_write_json(qdir / "reason.json", {"reasons": reasons, "ts": common.iso_now()})
 
 
+def publish_staged_output(staging_file: Path, final_output: Path, rec: dict,
+                          results_raw: Path) -> None:
+    """CS-014/CS-004: atomically move a schema-VALID staged scanner output into the
+    immutable raw namespace; anything that failed validation (parser error, missing,
+    corrupt) is quarantined and never published. Mutates rec['output_file']."""
+    import os
+    import shutil
+    if rec.get("schema_valid") and staging_file.exists():
+        common.ensure_dir(final_output.parent)
+        os.replace(str(staging_file), str(final_output))     # atomic within the same fs
+        rec["output_file"] = (str(final_output.relative_to(STUDY_ROOT))
+                              if _within(final_output, STUDY_ROOT) else str(final_output))
+        return
+    rec["output_file"] = None
+    if staging_file.exists():                                # invalid output -> quarantine
+        qdir = results_raw / "quarantine" / common.iso_now().replace(":", "").replace("-", "")
+        common.ensure_dir(qdir)
+        shutil.move(str(staging_file), str(qdir / staging_file.name))
+        common.atomic_write_json(qdir / "reason.json", {
+            "reasons": [f"unpublished:{rec.get('status')}"],
+            "repository_full_name": rec.get("repository_full_name"), "ts": common.iso_now()})
+
+
 def run_all(scanner: str, clone_manifest: list[dict], run_fn: RunFn, *,
             image: Optional[str] = None, docker: str = "docker",
             ready_marker: Optional[dict] = None, pilot_ids: Optional[set] = None,
@@ -465,7 +488,7 @@ def run_all(scanner: str, clone_manifest: list[dict], run_fn: RunFn, *,
         repo_host = repos_root / safe
         if not repo_host.exists():
             continue
-        output_host = results_raw / f"{safe}.{ext}"
+        final_output = results_raw / f"{safe}.{ext}"    # immutable published raw output
         sidecar = results_raw / f"{safe}.record.json"
         commit_sha = entry.get("checked_out_sha")
 
@@ -476,15 +499,15 @@ def run_all(scanner: str, clone_manifest: list[dict], run_fn: RunFn, *,
             n_wf = count_workflow_files(repo_host)
             if n_wf == 0:
                 rec = not_applicable_record(scanner, full, entry.get("anonymous_id"),
-                                            commit_sha, ctx, output_host,
+                                            commit_sha, ctx, final_output,
                                             reason="no_github_workflows")
                 common.atomic_write_json(sidecar, rec)
                 records.append(rec)
                 _append_event(events_path, log_path, rec)
                 continue
 
-        if output_host.exists() or sidecar.exists():
-            valid, reasons = validate_existing_output(output_host, sidecar, scanner,
+        if final_output.exists() or sidecar.exists():
+            valid, reasons = validate_existing_output(final_output, sidecar, scanner,
                                                       full, commit_sha, ctx)
             if valid:
                 rec = common.read_json(sidecar)
@@ -493,11 +516,20 @@ def run_all(scanner: str, clone_manifest: list[dict], run_fn: RunFn, *,
                 _append_event(events_path, log_path, rec)
                 continue
             # Invalid/stale -> quarantine and re-scan (do NOT skip on path existence).
-            _quarantine(output_host, sidecar, results_raw, reasons)
+            _quarantine(final_output, sidecar, results_raw, reasons)
+
+        # CS-014: the scanner may write ONLY to a unique, empty, per-invocation
+        # staging directory (mounted rw). Every other mount -- repo, config, rules,
+        # DBs -- is read-only, and the shared raw-results root is NOT exposed, so a
+        # scanner compromise cannot touch another repo's or scanner's results.
+        staging_dir = STUDY_ROOT / "results" / "staging" / scanner / safe
+        import shutil
+        shutil.rmtree(staging_dir, ignore_errors=True)  # clear stale staging for THIS repo
+        staging_file = staging_dir / f"result.{ext}"
 
         mounts = [
             (str(repos_root), "/scan/repositories", "ro"),
-            (str(STUDY_ROOT / cfg["paths"]["results_raw"]), "/scan/results/raw", "rw"),
+            (str(staging_dir), "/scan/output", "rw"),   # the ONLY writable mount
             (str(common.CONFIG_DIR), "/scan/config", "ro"),
             (str(STUDY_ROOT / "config" / "semgrep-rules-cache"), "/scan/semgrep-rules", "ro"),
             (str(STUDY_ROOT / "config" / "trivy-cache"), "/scan/trivy-cache", "ro"),
@@ -506,10 +538,13 @@ def run_all(scanner: str, clone_manifest: list[dict], run_fn: RunFn, *,
         container_name = f"cds-{scanner}-{safe}"[:120]
         rec = run_one(
             scanner, full, entry.get("anonymous_id"), commit_sha,
-            f"/scan/repositories/{safe}", output_host,
-            f"/scan/results/raw/{scanner}/{safe}.{ext}", mounts, image, isolation,
+            f"/scan/repositories/{safe}", staging_file,
+            f"/scan/output/result.{ext}", mounts, image, isolation,
             run_fn, docker, accepted_exit_codes=accepted, run_context=ctx,
             container_name=container_name, kill_fn=kill_fn)
+        # Validate + atomically PUBLISH the staged output into the immutable raw
+        # namespace (or quarantine it if it failed validation).
+        publish_staged_output(staging_file, final_output, rec, results_raw)
         common.atomic_write_json(sidecar, rec)          # one record per repo x scanner
         records.append(rec)
         _append_event(events_path, log_path, rec)
