@@ -522,6 +522,48 @@ def test_validate_existing_output(tmp_path):
     assert ok is False and "output_schema_invalid" in reasons
 
 
+def test_zizmor_not_applicable_without_workflows(tmp_path, monkeypatch):
+    """CS-017: a repo with no .github/workflows -> NOT_APPLICABLE, no container run."""
+    monkeypatch.setattr(sr, "STUDY_ROOT", tmp_path)
+    repo = tmp_path / "repositories" / "selected" / "o__r"
+    repo.mkdir(parents=True)               # NO .github/workflows
+    marker = {"pinned_scanner_versions": {"zizmor": "1.0.0"}, "image_digest": "IMG",
+              "configuration_hash": common.config_bundle_hash()}
+    manifest = [{"repository_full_name": "o/r", "status": "OK",
+                 "anonymous_id": "CLR-0001", "checked_out_sha": "sha1"}]
+
+    def boom(cmd):
+        raise AssertionError("zizmor must not run a container when not applicable")
+
+    recs = sr.run_all("zizmor", manifest, boom, ready_marker=marker)
+    assert recs[0]["status"] == "NOT_APPLICABLE"
+    assert recs[0]["finding_count"] is None and recs[0]["applicable_file_count"] == 0
+    assert recs[0]["error_message"] == "no_github_workflows"
+
+    # With a workflow present, zizmor DOES run.
+    (repo / ".github" / "workflows").mkdir(parents=True)
+    (repo / ".github" / "workflows" / "ci.yml").write_text("on: push", encoding="utf-8")
+    raw = tmp_path / "results" / "raw" / "zizmor" / "o__r.sarif"
+
+    def run_fn(cmd):
+        raw.parent.mkdir(parents=True, exist_ok=True)
+        raw.write_text(json.dumps({"version": "2.1.0", "runs": []}), encoding="utf-8")
+        return 0, "", ""
+
+    recs2 = sr.run_all("zizmor", manifest, run_fn, ready_marker=marker)
+    assert recs2[0]["status"] == "NO_FINDINGS"
+
+
+def test_count_workflow_files(tmp_path):
+    assert sr.count_workflow_files(tmp_path) == 0
+    wf = tmp_path / ".github" / "workflows"
+    wf.mkdir(parents=True)
+    (wf / "ci.yml").write_text("on: push", encoding="utf-8")
+    (wf / "release.yaml").write_text("on: tag", encoding="utf-8")
+    (wf / "notes.md").write_text("ignore me", encoding="utf-8")
+    assert sr.count_workflow_files(tmp_path) == 2
+
+
 def test_run_all_records_accumulate_resume_and_quarantine(tmp_path, monkeypatch):
     monkeypatch.setattr(sr, "STUDY_ROOT", tmp_path)
     (tmp_path / "repositories" / "selected" / "o__r").mkdir(parents=True)

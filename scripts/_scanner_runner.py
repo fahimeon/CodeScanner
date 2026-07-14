@@ -40,7 +40,8 @@ EXEC_FIELDS = ["repository_full_name", "anonymous_id", "scanner", "commit_sha",
                "scanner_version", "ruleset_or_db_hash", "image_digest",
                "configuration_hash", "status", "exit_code", "start_time", "end_time",
                "duration_seconds", "timeout_status", "finding_count", "files_analysed",
-               "schema_valid", "reused", "output_file", "error_message"]
+               "applicable_file_count", "schema_valid", "reused", "output_file",
+               "error_message"]
 
 # Identity fields that MUST match before an existing raw output may be reused.
 IDENTITY_FIELDS = ["repository_full_name", "commit_sha", "scanner", "scanner_version",
@@ -282,6 +283,36 @@ def _files_analysed(scanner: str, text: str) -> Optional[int]:
     return None
 
 
+def count_workflow_files(repo_host: Path) -> int:
+    """Number of GitHub Actions workflow files in a cloned repo (CS-017). Zizmor
+    only applies when at least one exists; zero means NOT_APPLICABLE, not an error."""
+    wf = repo_host / ".github" / "workflows"
+    if not wf.is_dir():
+        return 0
+    return sum(1 for p in wf.rglob("*") if p.is_file() and p.suffix.lower() in (".yml", ".yaml"))
+
+
+def not_applicable_record(scanner: str, repo_full: str, anon_id: Optional[str],
+                          commit_sha: Optional[str], ctx: dict, output_host: Path,
+                          reason: str, applicable_file_count: int = 0) -> dict:
+    """A complete NOT_APPLICABLE execution record (no container was run)."""
+    now = common.iso_now()
+    return {
+        "repository_full_name": repo_full, "anonymous_id": anon_id, "scanner": scanner,
+        "commit_sha": commit_sha, "scanner_version": ctx.get("scanner_version"),
+        "ruleset_or_db_hash": ctx.get("ruleset_or_db_hash"),
+        "image_digest": ctx.get("image_digest"),
+        "configuration_hash": ctx.get("configuration_hash"),
+        "status": "NOT_APPLICABLE", "exit_code": None, "start_time": now, "end_time": now,
+        "duration_seconds": 0.0, "timeout_status": "OK", "finding_count": None,
+        "files_analysed": None, "applicable_file_count": applicable_file_count,
+        "schema_valid": None, "reused": False,
+        "output_file": str(output_host.relative_to(STUDY_ROOT))
+                       if _within(output_host, STUDY_ROOT) else str(output_host),
+        "error_message": reason,
+    }
+
+
 def run_one(scanner: str, repo_full: str, anon_id: Optional[str], commit_sha: Optional[str],
             repo_container_path: str, output_host: Path, output_container_path: str,
             mounts: list[tuple], image: str, isolation: dict,
@@ -346,6 +377,7 @@ def run_one(scanner: str, repo_full: str, anon_id: Optional[str], commit_sha: Op
         "timeout_status": "TIMEOUT" if timed_out else "OK",
         "finding_count": finding_count,
         "files_analysed": files_analysed,
+        "applicable_file_count": None,
         "schema_valid": schema_valid,
         "reused": False,
         "output_file": str(output_host.relative_to(STUDY_ROOT))
@@ -436,6 +468,20 @@ def run_all(scanner: str, clone_manifest: list[dict], run_fn: RunFn, *,
         output_host = results_raw / f"{safe}.{ext}"
         sidecar = results_raw / f"{safe}.record.json"
         commit_sha = entry.get("checked_out_sha")
+
+        # CS-017: zizmor only applies to repos WITH GitHub Actions workflows. No
+        # workflows -> NOT_APPLICABLE (a defensible conclusion), never a scanner
+        # error or a misleading zero-risk NO_FINDINGS. Determined before scanning.
+        if scanner == "zizmor":
+            n_wf = count_workflow_files(repo_host)
+            if n_wf == 0:
+                rec = not_applicable_record(scanner, full, entry.get("anonymous_id"),
+                                            commit_sha, ctx, output_host,
+                                            reason="no_github_workflows")
+                common.atomic_write_json(sidecar, rec)
+                records.append(rec)
+                _append_event(events_path, log_path, rec)
+                continue
 
         if output_host.exists() or sidecar.exists():
             valid, reasons = validate_existing_output(output_host, sidecar, scanner,

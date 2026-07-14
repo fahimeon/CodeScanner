@@ -242,6 +242,7 @@ execution_statuses:
   - SUCCESS
   - SUCCESS_WITH_FINDINGS
   - NO_FINDINGS
+  - NOT_APPLICABLE          # scanner does not apply to this repo (e.g. zizmor, no workflows)
   - TIMEOUT
   - UNSUPPORTED
   - PARSER_ERROR
